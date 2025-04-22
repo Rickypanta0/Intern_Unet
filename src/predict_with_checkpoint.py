@@ -21,7 +21,7 @@ if __name__ == "__main__":
     
     imgs_list = []
     masks_list = []
-    N = 30
+    N = 5
 
     for i, (img_path, mask_path) in enumerate(folds):
         print(f"i: {i}")
@@ -67,6 +67,7 @@ if __name__ == "__main__":
     thresholds = [0.3, 0.4, 0.5,0.6]
     Ptrain, Pval, Ptest = predict_masks(model=final,X_train=X_train,X_test=X_test)
 
+    show_threshold_pairs_test(X_train,Y_train,Ptrain,thresholds=thresholds)
     show_threshold_pairs_test(X_train,Y_train,Ptrain,thresholds=thresholds)
 
 
