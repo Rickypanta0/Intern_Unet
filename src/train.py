@@ -9,7 +9,7 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 
 from src.data_loader import load_folds
-from src.model import get_model_BB,get_model
+from src.model import get_model, get_model_paper
 from src.callbacks import get_callbacks
 
 
@@ -51,8 +51,8 @@ def train(
     #)
 
     # 2) Modello
-    model = get_model(input_shape=X_train.shape[1:], learning_rate=learning_rate)
-
+    model = get_model_paper(input_shape=X_train.shape[1:])
+    model.summary()
     # 3) Campione per ImageLogger
     idx = np.random.randint(len(X_train))
     x_sample = X_train[idx:idx+1]
@@ -60,7 +60,7 @@ def train(
 
     # 4) Callback
     log_dir = os.path.join("logs", "fit", datetime.now().strftime("%Y%m%d-%H%M%S"))
-    checkpoint = os.path.join("models", "checkpoints", "model_for_nuclei.keras")
+    checkpoint = os.path.join("models", "checkpoints", "model_for_nuclei_paper_3heads_v2.keras")
     callbacks = get_callbacks(
         log_dir=log_dir,
         x_sample=x_sample,
@@ -84,8 +84,8 @@ def train(
     model.save("models/final/unet_final.keras")
 
     # 7) Valutazione
-    loss, miou = model.evaluate(X_test, Y_test, verbose=1)
-    print(f"Test loss: {loss:.4f} — Test MeanIoU: {miou:.4f}")
+    result = model.evaluate(X_test, Y_test, verbose=1)
+    #print(f"Test loss: {result['loss']:.4f} — Test MeanIoU: {result['miou']:.4f} -- Test accuracy: {result['accuracy']:.4f}")
 
     return model, history
 

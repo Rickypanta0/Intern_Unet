@@ -48,7 +48,7 @@ def get_callbacks(
     x_sample: np.ndarray,
     y_sample: np.ndarray,
     checkpoint_path: str = "model_for_nuclei.keras",
-    patience: int = 2
+    patience: int = 3
 ) -> list[tf.keras.callbacks.Callback]:
     """
     Crea e restituisce la lista di callback per il training:
@@ -95,4 +95,13 @@ def get_callbacks(
         y_sample=y_sample
     )
 
-    return [checkpoint_cb, image_logger_cb, earlystop_cb, tensorboard_cb]
+    #Dynamic Learning rate
+    lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=1
+        )
+
+    return [checkpoint_cb, earlystop_cb, tensorboard_cb, lr_cb]#, image_logger_cb]
