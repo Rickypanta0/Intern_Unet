@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 if __name__ == "__main__":
     SEED = 42
     np.random.seed = SEED
-    base = os.path.join( 'data','raw')
+    base = os.path.join( 'data','raw','val')
     folds = [
         (os.path.join(base, 'Fold 3', 'images', 'fold3', 'images.npy'),
          os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy'))
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     
     imgs_list = []
     masks_list = []
-    N = 15
+    N = 12
 
     for i, (img_path, mask_path) in enumerate(folds):
         print(f"i: {i}")
@@ -43,6 +43,25 @@ if __name__ == "__main__":
         print(f"imgs_list: {len(imgs_list)}, masks_list: {len(masks_list)}")
     
     X = np.concatenate(imgs_list, axis=0) / 255 
+
+    Xf = X.astype(np.float32)
+
+    # 1) calcola la media per canale
+    # se X ha shape (N,H,W,C):
+    mean = Xf.mean(axis=(0,1,2), keepdims=True)
+    # se X è singola immagine (H,W,C), usa mean = Xf.mean(axis=(0,1), keepdims=True)
+
+    alpha = 1.4  # >1 aumenta il contrasto
+
+    # 2) formula del contrast stretch
+    Xc = mean + alpha * (Xf - mean)
+
+    # 3) ritaglia al range originale
+    if X.dtype == np.uint8:
+        Xc = np.clip(Xc, 0, 255).astype(np.uint8)
+    else:
+        Xc = np.clip(Xc, 0.0, 1.0)
+
     Y = np.concatenate(masks_list, axis=0)
     print(len(X),len(Y))
 
@@ -52,8 +71,8 @@ if __name__ == "__main__":
     #plt.show()
 
     checkp_base = os.path.join( 'models')
-    checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_for_nuclei_paper_3heads_v2.keras')
-    check = os.path.join(checkp_base, 'checkpoints', 'model_for_nuclei_paper.keras')
+    checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_paper_v3.keras')
+    check = os.path.join(checkp_base, 'checkpoints', 'model_paper_v4.keras')
     #X, Y = load_folds(folds=folds)
     final = load_model(checkpoint_path=checkp_folds)
     paper = load_model(checkpoint_path=check)
@@ -62,7 +81,7 @@ if __name__ == "__main__":
 
 
     X_train, X_test, Y_train, Y_test = train_test_split(
-        X, Y, test_size=0.1, random_state=SEED)
+        Xc, Y, test_size=0.1, random_state=SEED)
     
     thresholds = [0.3, 0.4, 0.5,0.6]
     output = final.predict(X_train)
@@ -83,6 +102,16 @@ if __name__ == "__main__":
 
     binary_mask = (cell_prob > bg_prob).astype(np.uint8)
 
+    cell_prob1 = np.maximum(out[0,:,:,0], out[0,:,:,1])
+    bg_prob1   = out[0,:,:,1]
+
+# normalizza
+    total1 = cell_prob1 + bg_prob1
+    cell_prob1 /= total1
+    bg_prob1   /= total1
+
+    binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
+
     for i in range(output.shape[0]): 
         mask = (output[i,:,:,0]+output[i,:,:,2]>output[i,:,:,1])
         B = (output[i,:,:,0]>output[i,:,:,2]) & (output[i,:,:,0]>output[i,:,:,1])
@@ -94,17 +123,36 @@ if __name__ == "__main__":
         pred.append(BM)
         predB.append(Bord)
 
-    fig, axs = plt.subplots(2,3,figsize=(8,8))
-    axs[0,0].imshow(binary_mask,cmap='gray')
-    axs[0,1].imshow(Y_train[0], cmap='gray')
+for i in range(X.shape[0]):
+    fig, axs = plt.subplots(2,2,figsize=(8,8))
+    axs[0,0].imshow(X_train[i])
+    axs[0,1].imshow(Y_train[i], cmap='gray')
     axs[0,1].set_title("GT")
-    axs[0,2].imshow(output[0,:,:,0], cmap='gray')
-    axs[1,0].imshow(output[0,:,:,1], cmap='gray')
-    axs[1,1].imshow(output[0,:,:,2], cmap='gray')
 
-    out_ = (out[:,:,:,:]>0.5).astype(np.uint8)
-    axs[1,2].imshow(pred_min[0],cmap='gray')
-    axs[1,2].set_title("No 3 heads")
+    cell_prob = np.maximum(output[i,:,:,0], output[i,:,:,1])
+    bg_prob   = output[i,:,:,1]
+
+# normalizza
+    total = cell_prob + bg_prob
+    cell_prob /= total
+    bg_prob   /= total
+
+    binary_mask = (cell_prob > bg_prob).astype(np.uint8)
+
+    cell_prob1 = np.maximum(out[i,:,:,0], out[i,:,:,1])
+    bg_prob1   = out[i,:,:,1]
+
+# normalizza
+    total1 = cell_prob1 + bg_prob1
+    cell_prob1 /= total1
+    bg_prob1   /= total1
+
+    binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
+
+    axs[1,0].imshow(binary_mask2, cmap='gray')
+    axs[1,0].set_title("vn")
+    axs[1,1].imshow(binary_mask,cmap='gray')
+    axs[1,1].set_title("v2")
     plt.show()
 
     

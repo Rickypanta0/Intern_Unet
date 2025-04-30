@@ -60,7 +60,7 @@ def train(
 
     # 4) Callback
     log_dir = os.path.join("logs", "fit", datetime.now().strftime("%Y%m%d-%H%M%S"))
-    checkpoint = os.path.join("models", "checkpoints", "model_for_nuclei_paper_3heads_v2.keras")
+    checkpoint = os.path.join("models", "checkpoints", "model_for_nuclei_paper_3heads_v3.keras")
     callbacks = get_callbacks(
         log_dir=log_dir,
         x_sample=x_sample,

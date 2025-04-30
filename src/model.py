@@ -4,7 +4,7 @@ Definizione dell'architettura U-Net e compilazione del modello mantenendo lo sti
 """
 import tensorflow as tf
 from keras.metrics import MeanIoU
-from src.losses import csca_binary_loss, bce_dice_loss
+from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou
 
 
 def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
@@ -76,8 +76,8 @@ def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     model.compile(optimizer=optimizer,
-                  loss=bce_dice_loss,
-                  metrics=[MeanIoU(num_classes=2)])
+                  loss=Lp,
+                  metrics=[binary_iou])
     return model
 
 def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):

@@ -99,3 +99,36 @@ def csca_binary_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     dice_coeff = (2.0 * intersection + _smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + _smooth)
     dice_loss_val = 1.0 - dice_coeff
     return _lambda1 * bce + _lambda2 * dice_loss_val
+
+def dice_loss_class(y_true, y_pred, k, smooth=1e-6):
+    t = y_true[..., k]
+    p = y_pred[..., k]
+    inter = tf.reduce_sum(t * p, axis=[1,2])
+    denom = tf.reduce_sum(t, axis=[1,2]) + tf.reduce_sum(p, axis=[1,2])
+    return 1 - (2*inter + smooth)/(denom + smooth)
+
+def Lp(y_true, y_pred):
+    # Cp = CE multiclasse
+    cce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+    Cp  = tf.reduce_mean(cce)
+    # D1 sul canale BD (k=0), D2 sul canale CB (k=2)
+    D1  = tf.reduce_mean(dice_loss_class(y_true, y_pred, k=0))
+    D2  = tf.reduce_mean(dice_loss_class(y_true, y_pred, k=2))
+    return 2*Cp + 1*D1 + 2*D2
+
+# ————————————————————————————————
+# 2) Metriche binarie “nucleo vs background”:
+#    consideriamo “nucleo” i canali BD (0) e CB (2), background = canale BG (1)
+
+def binary_iou(y_true, y_pred):
+    # y_true, y_pred: (B,H,W,3) one-hot/softmax
+    # facciamo due maschere booleane: nucleo vs non-nucleo
+    true_labels = tf.argmax(y_true, axis=-1)    # 0=BD,1=BG,2=CB
+    pred_labels = tf.argmax(y_pred, axis=-1)
+    true_bin = tf.cast(tf.not_equal(true_labels, 1), tf.int32)
+    pred_bin = tf.cast(tf.not_equal(pred_labels, 1), tf.int32)
+    # intersection & union per batch
+    intersection = tf.reduce_sum(tf.cast(true_bin & pred_bin, tf.float32), axis=[1,2])
+    union        = tf.reduce_sum(tf.cast(true_bin | pred_bin, tf.float32), axis=[1,2])
+    iou = (intersection + 1e-6) / (union + 1e-6)
+    return tf.reduce_mean(iou)
