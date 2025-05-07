@@ -72,7 +72,7 @@ if __name__ == "__main__":
 
     checkp_base = os.path.join( 'models')
     checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_paper_v3.keras')
-    check = os.path.join(checkp_base, 'checkpoints', 'model_paper_v4.keras')
+    check = os.path.join(checkp_base, 'checkpoints', 'model_backbone.keras')
     #X, Y = load_folds(folds=folds)
     final = load_model(checkpoint_path=checkp_folds)
     paper = load_model(checkpoint_path=check)

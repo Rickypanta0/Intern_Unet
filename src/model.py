@@ -209,6 +209,79 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     
     return model
 
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.layers import UpSampling2D, concatenate, Conv2D, BatchNormalization, Activation, Dropout
+from tensorflow.keras.models import Model
+
+
+
+def build_unet_with_resnet50(input_shape=(256,256,3)):
+    # 1) Input
+    inputs = tf.keras.Input(shape=input_shape)
+
+    # 2) ResNet50 come encoder, usando il nostro Input
+    resnet = ResNet50(
+        include_top=False,
+        weights='imagenet',
+        input_tensor=inputs
+    )
+
+    # 3) Definisci i nomi dei layer di cui prendere gli skip
+    skip_names = [
+        'conv1_relu',         # dopo il primo conv+bn+relu  => output  (H/2, W/2,   64)
+        'conv2_block3_out',   # fine del blocco 2         => output  (H/4, W/4,  256)
+        'conv3_block4_out',   # fine del blocco 3         => output  (H/8, W/8,  512)
+        'conv4_block6_out',   # fine del blocco 4         => output  (H/16,W/16,1024)
+    ]
+    # l’ultimo feature map (bottleneck) sarà il conv5_block3_out
+    bottleneck_name = 'conv5_block3_out'
+
+    # 4) Raccogli i tensori intermedi
+    skips = [resnet.get_layer(name).output for name in skip_names]
+    bottleneck = resnet.get_layer(bottleneck_name).output
+    
+    # 5) Decoder (mimando la tua struttura)
+    x = bottleneck
+    drop_rates = [0.3, 0.2, 0.2, 0.1]
+    filter_sizes = [256, 128, 64,  32]
+
+    for i, (skip, dr, fs) in enumerate(zip(reversed(skips), reversed(drop_rates), reversed(filter_sizes))):
+        x = UpSampling2D(size=(2,2), interpolation='nearest')(x)
+        x = concatenate([x, skip])
+        x = Conv2D(fs, (3,3), padding='same', kernel_initializer='he_normal')(x)
+        x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
+        x = Activation('relu')(x)
+        x = Dropout(dr)(x)
+        x = Conv2D(fs, (3,3), padding='same', kernel_initializer='he_normal')(x)
+        x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
+        x = Activation('relu')(x)
+
+    # 5) Ultimo upsampling per risalire da 128×128 a 256×256
+    x = UpSampling2D(size=(2,2), interpolation='nearest')(x)
+
+    # 6) Testata di segmentazione
+    x = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x)
+    x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.1)(x)
+    seg_head = Conv2D(
+        filters=3,
+        kernel_size=(1,1),
+        activation='softmax',
+        name='seg_head'
+    )(x)
+
+    # 7) Compila il modello
+    model = Model(inputs=inputs, outputs=seg_head)
+    #model.compile(
+    #    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+    #    loss=bce_dice_loss,
+    #    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
+    #)
+    #model.summary()
+    model.backbone = resnet
+    return model
+
 if __name__ == "__main__":
     # Test e summary
     unet_model = get_model()

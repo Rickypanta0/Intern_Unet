@@ -8,9 +8,10 @@ from .predict import predict_masks
 from .utils.visualization import show_threshold_pairs_test
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
-from src.model import get_model_paper
+from src.model import get_model_paper, build_unet_with_resnet50
 from src.callbacks import get_callbacks
 import math 
+from src.losses import csca_binary_loss, bce_dice_loss
 from tensorflow import keras 
 
 if __name__=="__main__":
@@ -31,6 +32,21 @@ if __name__=="__main__":
     SEED = 42
     np.random.seed = SEED
 
+class UnfreezeCallback(tf.keras.callbacks.Callback):
+    def __init__(self, unfreeze_epoch):
+        super().__init__()
+        self.unfreeze_epoch = unfreeze_epoch
+        self.done = False
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if not self.done and epoch == self.unfreeze_epoch:
+            print(f"\n>> Epoca {epoch}: scongelo tutto il backbone")
+            self.model.backbone.trainable = True
+
+            # crei anche i momenti m/v di Adam per i nuovi pesi
+            self.model.optimizer._create_all_weights(self.model.trainable_variables)
+
+            self.done = True
 
 
 class NpyDataGenerator(keras.utils.Sequence):
@@ -81,54 +97,142 @@ class NpyDataGenerator(keras.utils.Sequence):
         if self.shuffle:
             np.random.shuffle(self.indexes)
 
+    def augm(self,
+            seed: tuple[int,int],
+            img: np.ndarray,
+            mask: np.ndarray,
+            zoom_size:int,
+            IMG_SIZE: int) -> tuple[np.ndarray,np.ndarray]:
+
+        img  = tf.convert_to_tensor(img,  dtype=tf.float32)
+        mask = tf.convert_to_tensor(mask, dtype=tf.float32)
+
+
+        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+        #augmentation img
+        padded = tf.image.resize_with_crop_or_pad(img, IMG_SIZE+6, IMG_SIZE+6)
+        seed_ = tf.random.experimental.stateless_split(seed, num=2)
+        seed = seed_[0]
+        crop = tf.image.stateless_random_crop(padded, [zoom_size, zoom_size, 3], seed=seed)
+
+        zoom_factor = zoom_size/IMG_SIZE
+        new_size = int(IMG_SIZE * zoom_factor)
+
+        delta = IMG_SIZE - zoom_size
+        pad_h = IMG_SIZE - new_size
+        pad_w = IMG_SIZE - new_size
+        pad_top    = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left   = pad_w // 2
+        pad_right  = pad_w - pad_left
+        """
+        zoomed = tf.image.resize(crop, [new_size, new_size])  
+        zoomed_padded = tf.pad(
+            zoomed,
+            [[pad_top, pad_bottom],
+             [pad_left, pad_right],
+             [0,       0      ]],            # nessun padding sui canali
+            constant_values=0.0               # riempi con zeri
+        )
+        """
+        zoomed_padded = tf.image.resize(
+        tf.image.central_crop(padded, central_fraction=zoom_size/IMG_SIZE),
+        [IMG_SIZE, IMG_SIZE]
+        )
+
+
+        mask = tf.expand_dims(mask, axis=-1)
+
+        padded_mask = tf.image.resize_with_crop_or_pad(mask, IMG_SIZE+6, IMG_SIZE+6)
+        crop_mask = tf.image.stateless_random_crop(padded_mask, [zoom_size, zoom_size, 1], seed=seed)
+
+        zoom_factor = zoom_size/IMG_SIZE
+        new_size = int(IMG_SIZE * zoom_factor)
+
+        delta = IMG_SIZE - zoom_size
+        pad_h = IMG_SIZE - new_size
+        pad_w = IMG_SIZE - new_size
+        pad_top    = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left   = pad_w // 2
+        pad_right  = pad_w - pad_left
+        """
+        zoomed = tf.image.resize(crop_mask, [new_size, new_size])  
+
+        zoomed_padded_Y = tf.pad(
+            zoomed,
+            [[pad_top, pad_bottom],
+             [pad_left, pad_right],
+             [0,       0      ]],            # nessun padding sui canali
+            constant_values=1               # riempi con zeri
+        )
+        """
+        zoomed_padded_Y = tf.image.resize(
+        tf.image.central_crop(padded_mask, central_fraction=zoom_size/IMG_SIZE),
+        [IMG_SIZE, IMG_SIZE]
+        )
+        xp = zoomed_padded.numpy().astype(np.float32)
+        yp = zoomed_padded_Y.numpy().astype(np.uint8)
+        return xp, yp
+
+
+    def _make_target_3ch(self, m2: np.ndarray) -> np.ndarray:
+        """Dalla maschera 2D binaria (H,W) ritorna (H,W,3) [body,bg,border]."""
+        struct = np.ones((3,3), dtype=bool)
+        body       = binary_erosion(m2, structure=struct).astype(np.uint8)
+        border     = (m2 - body).clip(0,1).astype(np.uint8)
+        background = (1 - m2).astype(np.uint8)
+        return np.stack([body, background, border], axis=-1)
+
+
     def __data_generation(self, list_temp):
-        print(f"[DataGen] Generating batch per indici {list_temp[:5]}…")
+        # numero di augmentazioni per sample
+        n_aug =  6  # 4 zoom + flipLR + flipUD, ad esempio
+        batch_n = len(list_temp) * n_aug
 
-        # 1) decidiamo le dimensioni di Xb e Yb
-        if self.patch_size is None:
-            H, W, C = self.X.shape[1:]    # img shape = (N, H, W, C)
-        else:
-            H = W = self.patch_size
-            C = self.X.shape[3]
+        # dimensioni immagine
+        H, W, C = self.X.shape[1:] if self.patch_size is None else (self.patch_size,)*2 + (self.X.shape[-1],)
 
-        # 2) allochiamo gli array batch: Xb per le immagini, Yb per i 3 canali target
-        Xb = np.empty((len(list_temp), H, W, C), dtype=np.float32)
-        Yb = np.empty((len(list_temp), H, W, 3), dtype=np.uint8)
+        # pre-allocazione
+        Xb = np.empty((batch_n, H, W, C), dtype=np.float32)
+        Yb = np.empty((batch_n, H, W, 3),   dtype=np.uint8)
 
-        for i, idx in enumerate(list_temp):
-            # 3) estrai l'immagine e la maschera binaria  
-            img = self.X[idx]           # shape (H, W, C), valori 0–255
-            msk = self.Y[idx]           # shape (H, W) o (H, W, 1)
-            if msk.ndim == 3 and msk.shape[-1] == 1:
-                msk = msk[..., 0]       # ora msk è (H, W)
+        k = 0   # contatore totale delle righe di Xb/Yb
 
-            # 4) (opzionale) crop a patch_size se lo desideri
-            #    qui commentato perché non comune per istologia
-            # if self.patch_size is not None:
-            #     ps = self.patch_size
-            #     img = img[:ps, :ps, :]
-            #     msk = msk[:ps, :ps]
+        for idx in list_temp:
+            img = self.X[idx]/255          # np.ndarray (H,W,C), valori 0–255
+            raw = self.Y[idx]          # np.ndarray (H,W,1)
+            msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
 
-            # 5) normalizza l'immagine in [0,1]
-            Xb[i] = (img.astype(np.float32) / 255.0)
+            # 1) originale
+            Xb[k] = img.astype(np.float32)
+            Yb[k] = self._make_target_3ch(msk)
+            k += 1
+            """"""
+            # 2) zoom augmentations (4 seed diversi)
+            for j in range(3):
+                seed = (idx, j)  # o qualunque combinazione di int
+                xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
+                Xb[k] = xz
+                yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
+                Yb[k] = self._make_target_3ch(yz_)
+                k += 1
+            # 3) flip left–right
+            img_lr = np.fliplr(img)
+            mask_lr = np.fliplr(msk)
+            Xb[k] = img_lr.astype(np.float32)
+            Yb[k] = self._make_target_3ch(mask_lr)
+            k += 1
 
-            # 6) calcola i 3 canali target da msk binaria
-            #    body = erode 1px
-            struct = np.ones((3,3), dtype=bool)
-            body       = binary_erosion(msk.astype(bool), structure=struct).astype(np.uint8)
-            #    border = la differenza tra mask intera e body
-            border     = (msk.astype(np.uint8) - body).clip(0,1)
-            #    background = 1 - msk
-            background = (1 - msk).astype(np.uint8)
+            # 4) flip up–down
+            img_ud = np.flipud(img)
+            mask_ud= np.flipud(msk)
+            Xb[k] = img_ud.astype(np.float32)
+            Yb[k] = self._make_target_3ch(mask_ud)
+            k += 1
 
-            # 7) impacchetta i 3 canali in Yb
-            #    canale 0 = body, 1 = background, 2 = border
-            Yb[i, ..., 0] = body
-            Yb[i, ..., 1] = background
-            Yb[i, ..., 2] = border
+        return Xb, Yb
 
-        # 8) cast finale e ritorno
-        return Xb.astype(np.float32), Yb.astype(np.float32)
 
 
 base = os.path.join( 'data','raw')
@@ -141,25 +245,7 @@ folds = [
      os.path.join(base, 'Fold 2', 'masks', 'fold2', 'binary_masks.npy'))
 ]
 
-"""X, Y = load_folds(folds, normalize_images=True)
-print(X.shape,Y.shape)
-Y = np.expand_dims(Y, axis=-1)
-Y_ = []
-for M in Y:
-    M2= np.squeeze(M,axis=-1)
-    struct = np.ones((3,3), dtype=bool)
-    body = binary_erosion(M2.astype(bool), structure=struct).astype(np.uint8)
-    # body = 1 sulle regioni interne più “sicure”
-    # 2) Il "bordo" è ciò che resta togliendo il body dal mask intero
-    border = (M2.astype(np.uint8) - body)
-    # border = 1 in corrispondenza dell’anello di 1 px attorno al body
-    # 3) Il "background" è l’inverso della mask originale
-    background = (1 - M2).astype(np.uint8)
-    # 4) Costruisci il GT 3‐canali
-    #    ordine: [body, background, border]
-    Y_gt = np.stack([body, background, border], axis=-1)
-    Y_.append(Y_gt)
-Y_ = np.stack(Y_,axis=0)"""
+
 num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
 all_IDs = list(range(num_all))
 # split 90/10
@@ -167,10 +253,10 @@ split = int(0.9 * num_all)
 train_IDs = all_IDs[:split]
 val_IDs   = all_IDs[split:]
 # generatori
-train_gen = NpyDataGenerator(folds, train_IDs, batch_size=8, shuffle=True, mmap=True)
-val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=8, shuffle=False, mmap=True)
+train_gen = NpyDataGenerator(folds, train_IDs, batch_size=4, shuffle=True, mmap=True)
+val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=4, shuffle=False, mmap=True)
 
-model = get_model_paper()
+model = build_unet_with_resnet50()
 #Dynamic Learning rate
 lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
         monitor='val_loss',
@@ -188,8 +274,10 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(
 
     # Checkpoint
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath=os.path.join('models','checkpoints','model_paper_v4.keras'),
+        filepath=os.path.join('models','checkpoints','model_backbone.weights.h5'),
         save_best_only=True,
+        save_weights_only=True,
+        monitor='val_loss',
         verbose=1
     )
 
@@ -199,9 +287,90 @@ earlystop_cb = tf.keras.callbacks.EarlyStopping(
         patience=4,
         verbose=1
     )
-
+#unfreeze_cb = UnfreezeCallback(unfreeze_epoch=1)
 Xb, Yb = train_gen[0]
+idx = np.random.randint(Xb.shape[0]-8)
+
+for i in range(idx,idx + 7):
+    fig, axs = plt.subplots(2, 2, figsize=(6,6))
+
+    axs[0,0].imshow(Xb[i],         vmin=0, vmax=1)                         # immagine normalizzata [0,1]
+    axs[0,1].imshow(Yb[i,:,:,0], cmap='gray', vmin=0, vmax=1)  # body
+    axs[1,0].imshow(Yb[i,:,:,1], cmap='gray', vmin=0, vmax=1)  # background
+    axs[1,1].imshow(Yb[i,:,:,2], cmap='gray', vmin=0, vmax=1)  # border
+
+    plt.tight_layout()
+    plt.show()
 print("Xb shape:", Xb.shape, "dtype:", Xb.dtype)
 print("Yb shape:", Yb.shape, "dtype:", Yb.dtype)
-model.fit(train_gen, validation_data=val_gen, epochs=50,verbose=1, callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, lr_cb])
+
+for layer in model.backbone.layers:
+    layer.trainable = False
+
+# Compilo con un LR “alto” per il solo decoder
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss=bce_dice_loss,
+    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
+)
+
+# Alleno decoder per 5 epoche
+model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=1,
+    batch_size=4,
+    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, lr_cb],
+    verbose=1
+)
+
+tf.keras.backend.clear_session()
+import gc; gc.collect()
+
+gpus = tf.config.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Limita l'uso della memoria GPU a 4 GB (ad esempio)
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=9500)]
+        )
+    except RuntimeError as e:
+        print(e)
+model = build_unet_with_resnet50()
+
+check = os.path.join('models', 'checkpoints', 'model_backbone.weights.h5')
+    #X, Y = load_folds(folds=folds)
+
+model.backbone.trainable = True
+fine_tune_at = 100
+
+# 2) Ri‐congelo solo gli ultimi layer del backbone
+for i, layer in enumerate(model.backbone.layers):
+    layer.trainable = (i >= fine_tune_at)
+
+model.load_weights(checkpoint_path=check)
+
+# 3) Ricompilo con un LR molto più basso
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6),
+    loss=bce_dice_loss,
+    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
+)
+
+# 4) Riprendo il training da epoca 5 a 50
+model.fit(
+    train_gen,
+    validation_data=val_gen,
+    initial_epoch=1,
+    epochs=50,
+    batch_size=4,
+    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, lr_cb],
+    verbose=1
+)
+
+
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)
