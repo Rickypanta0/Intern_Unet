@@ -71,8 +71,8 @@ if __name__ == "__main__":
     #plt.show()
 
     checkp_base = os.path.join( 'models')
-    checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_paper_v3.keras')
-    check = os.path.join(checkp_base, 'checkpoints', 'model_backbone.keras')
+    checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_paper_v5.keras')
+    check = os.path.join(checkp_base, 'checkpoints', 'model_grayscale.keras')
     #X, Y = load_folds(folds=folds)
     final = load_model(checkpoint_path=checkp_folds)
     paper = load_model(checkpoint_path=check)
@@ -150,9 +150,9 @@ for i in range(X.shape[0]):
     binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
 
     axs[1,0].imshow(binary_mask2, cmap='gray')
-    axs[1,0].set_title("vn")
+    axs[1,0].set_title("Grayscale")
     axs[1,1].imshow(binary_mask,cmap='gray')
-    axs[1,1].set_title("v2")
+    axs[1,1].set_title("Colored")
     plt.show()
 
     

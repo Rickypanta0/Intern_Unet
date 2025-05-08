@@ -79,7 +79,16 @@ def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
                   loss=Lp,
                   metrics=[binary_iou])
     return model
+class OneHotMeanIoU(tf.keras.metrics.MeanIoU):
+    def __init__(self, num_classes, name="mean_iou", **kwargs):
+        super().__init__(num_classes=num_classes, name=name, **kwargs)
 
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # y_true, y_pred: one-hot [..., num_classes]
+        y_true = tf.argmax(y_true, axis=-1)
+        y_pred = tf.argmax(y_pred, axis=-1)
+        # poi chiamo la classe base
+        return super().update_state(y_true, y_pred, sample_weight)
 def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     """
     Costruisce e compila il modello U-Net con architettura hardcoded.
@@ -203,8 +212,8 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
 
     model.compile(
         optimizer=optimizer,
-        loss=loss,
-        metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
+        loss=loss
+        #metrics=[OneHotMeanIoU(num_classes=3) ]
     )
     
     return model

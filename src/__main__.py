@@ -13,7 +13,8 @@ from src.callbacks import get_callbacks
 import math 
 from src.losses import csca_binary_loss, bce_dice_loss
 from tensorflow import keras 
-
+import tensorflow_io as tfio
+import cv2
 if __name__=="__main__":
     gpus = tf.config.list_physical_devices('GPU')
     for gpu in gpus:
@@ -96,85 +97,140 @@ class NpyDataGenerator(keras.utils.Sequence):
         self.indexes = np.arange(len(self.list_IDs))
         if self.shuffle:
             np.random.shuffle(self.indexes)
-
+    """
     def augm(self,
-            seed: tuple[int,int],
-            img: np.ndarray,
-            mask: np.ndarray,
-            zoom_size:int,
-            IMG_SIZE: int) -> tuple[np.ndarray,np.ndarray]:
+         seed: tuple[int,int],
+         img_np: np.ndarray,
+         mask_np: np.ndarray,
+         zoom_size: int,
+         IMG_SIZE: int
+        ) -> tuple[np.ndarray, np.ndarray]:
+        
+        img_np: numpy array, shape (H,W,1) o (H,W,3), valori 0–255 o già normalizzati
+        mask_np: numpy array, shape (H,W)
+        
 
-        img  = tf.convert_to_tensor(img,  dtype=tf.float32)
-        mask = tf.convert_to_tensor(mask, dtype=tf.float32)
+        # 1) Normalizza e porta a float32
+        # Se è (H,W) → (H,W,1)
+        if img_np.ndim == 2:
+            img_np = img_np[..., np.newaxis]
 
+        # 2) TensorFlow tensor
+        img_t = tf.convert_to_tensor(img_np, dtype=tf.float32)  # shape (H,W,C)
 
-        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
-        #augmentation img
-        padded = tf.image.resize_with_crop_or_pad(img, IMG_SIZE+6, IMG_SIZE+6)
-        seed_ = tf.random.experimental.stateless_split(seed, num=2)
-        seed = seed_[0]
-        crop = tf.image.stateless_random_crop(padded, [zoom_size, zoom_size, 3], seed=seed)
+        # 3) Se è single-channel, duplica in RGB
+        C = int(img_np.shape[-1])             # 1 o 3
 
-        zoom_factor = zoom_size/IMG_SIZE
-        new_size = int(IMG_SIZE * zoom_factor)
+        if C == 1:
+            img_t = tf.image.grayscale_to_rgb(img_t)            # ora (H,W,3)
+            C = 3
 
-        delta = IMG_SIZE - zoom_size
-        pad_h = IMG_SIZE - new_size
-        pad_w = IMG_SIZE - new_size
-        pad_top    = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left   = pad_w // 2
-        pad_right  = pad_w - pad_left
-        """
-        zoomed = tf.image.resize(crop, [new_size, new_size])  
-        zoomed_padded = tf.pad(
-            zoomed,
-            [[pad_top, pad_bottom],
-             [pad_left, pad_right],
-             [0,       0      ]],            # nessun padding sui canali
-            constant_values=0.0               # riempi con zeri
+        # 4) Padding
+        padded = tf.image.resize_with_crop_or_pad(img_t, IMG_SIZE + 6, IMG_SIZE + 6)
+
+        # 5) Stateless random crop, usando C canali
+        seed_tf = tf.convert_to_tensor(seed, dtype=tf.int32)
+        seed0   = tf.random.experimental.stateless_split(seed_tf, num=1)[0]
+        crop    = tf.image.stateless_random_crop(
+            padded,
+            size=[zoom_size, zoom_size, C],
+            seed=seed0
         )
-        """
+
+        # 6) Zoom-centered pad
         zoomed_padded = tf.image.resize(
-        tf.image.central_crop(padded, central_fraction=zoom_size/IMG_SIZE),
-        [IMG_SIZE, IMG_SIZE]
+            tf.image.central_crop(padded, central_fraction=zoom_size/IMG_SIZE),
+            [IMG_SIZE, IMG_SIZE]
         )
 
+        # 7) Stessa logica per la mask (sempre 1 canale)
+        mask_t = tf.expand_dims(tf.convert_to_tensor(mask_np, dtype=tf.float32), axis=-1)
+        padded_m = tf.image.resize_with_crop_or_pad(mask_t, IMG_SIZE + 6, IMG_SIZE + 6)
+        crop_m   = tf.image.stateless_random_crop(
+            padded_m,
+            size=[zoom_size, zoom_size, 1],
+            seed=seed0
+        )
+        zoomed_padded_m = tf.image.resize(
+            tf.image.central_crop(padded_m, central_fraction=zoom_size/IMG_SIZE),
+            [IMG_SIZE, IMG_SIZE]
+        )
 
-        mask = tf.expand_dims(mask, axis=-1)
+        # 8) Torna a NumPy
+        xz = zoomed_padded.numpy().astype(np.float32)
+        yz = zoomed_padded_m.numpy().astype(np.uint8)
 
-        padded_mask = tf.image.resize_with_crop_or_pad(mask, IMG_SIZE+6, IMG_SIZE+6)
-        crop_mask = tf.image.stateless_random_crop(padded_mask, [zoom_size, zoom_size, 1], seed=seed)
-
-        zoom_factor = zoom_size/IMG_SIZE
-        new_size = int(IMG_SIZE * zoom_factor)
-
-        delta = IMG_SIZE - zoom_size
-        pad_h = IMG_SIZE - new_size
-        pad_w = IMG_SIZE - new_size
-        pad_top    = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left   = pad_w // 2
-        pad_right  = pad_w - pad_left
+        return xz, yz
+            """
+    def augm(self,
+             seed: tuple[int,int],
+             img_np: np.ndarray,
+             mask_np: np.ndarray,
+             zoom_size: int,
+             IMG_SIZE: int
+            ) -> tuple[np.ndarray, np.ndarray]:
         """
-        zoomed = tf.image.resize(crop_mask, [new_size, new_size])  
-
-        zoomed_padded_Y = tf.pad(
-            zoomed,
-            [[pad_top, pad_bottom],
-             [pad_left, pad_right],
-             [0,       0      ]],            # nessun padding sui canali
-            constant_values=1               # riempi con zeri
-        )
+        img_np: np.ndarray (H,W,1) o (H,W,3), valori 0–255 o già normalizzati
+        mask_np: np.ndarray (H,W)
         """
-        zoomed_padded_Y = tf.image.resize(
-        tf.image.central_crop(padded_mask, central_fraction=zoom_size/IMG_SIZE),
-        [IMG_SIZE, IMG_SIZE]
-        )
-        xp = zoomed_padded.numpy().astype(np.float32)
-        yp = zoomed_padded_Y.numpy().astype(np.uint8)
-        return xp, yp
+        # 1) Assicuriamoci uint8 [0–255] e 2D/3D coerente
+        #if img_np.dtype != np.uint8:
+        #    img_np = (img_np*255).clip(0,255).astype(np.uint8)
+        if img_np.ndim == 2:
+            img_np = img_np[...,None]
 
+        # 2) Da numpy a tensor float32
+        img_t = tf.convert_to_tensor(img_np, dtype=tf.float32)
+        C     = img_t.shape[-1]
+        if C == 1:
+            img_t = tf.image.grayscale_to_rgb(img_t)
+            C     = 3
+
+        # 3) Pad per consentire il crop
+        padded = tf.image.resize_with_crop_or_pad(img_t, IMG_SIZE, IMG_SIZE)
+
+        # 4) Genera un seed diverso per ogni chiamata (passato da fuori)
+        seed_tf = tf.convert_to_tensor(seed, dtype=tf.int32)
+        margin = (zoom_size // 2) + 1  
+        padded_m = tf.pad(
+            img_t,
+            paddings=[[margin, margin],
+                      [margin, margin],
+                      [0, 0]],
+            mode='REFLECT'
+        )
+        # 5) Ritaglio vero e proprio (random crop)
+        crop = tf.image.stateless_random_crop(
+            padded_m,
+            size=[zoom_size, zoom_size, C],
+            seed=seed_tf
+        )
+
+        # 6) Ridimensiono il ritaglio a IMG_SIZE
+        xz = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE])
+# pad riflettente ai bordi
+        # 7) Stessa cosa per la mask
+        mask_t = tf.convert_to_tensor(mask_np[...,None], dtype=tf.float32)
+        padded_m = tf.image.resize_with_crop_or_pad(mask_t, IMG_SIZE, IMG_SIZE)
+        padded = tf.pad(
+            mask_t,
+            paddings=[[margin, margin],
+                      [margin, margin],
+                      [0, 0]],
+            mode='REFLECT'
+        )
+        crop_m   = tf.image.stateless_random_crop(
+            padded,
+            size=[zoom_size, zoom_size, 1],
+            seed=seed_tf
+        )
+        yz = tf.image.resize(crop_m, [IMG_SIZE, IMG_SIZE])
+
+        # 8) Da tensor a numpy
+        xz_np = xz.numpy().astype(np.float32)   # /255 se ti serve [0,1]
+        yz_np = yz.numpy().astype(np.uint8)
+
+        return xz_np, yz_np
 
     def _make_target_3ch(self, m2: np.ndarray) -> np.ndarray:
         """Dalla maschera 2D binaria (H,W) ritorna (H,W,3) [body,bg,border]."""
@@ -200,7 +256,9 @@ class NpyDataGenerator(keras.utils.Sequence):
         k = 0   # contatore totale delle righe di Xb/Yb
 
         for idx in list_temp:
-            img = self.X[idx]/255          # np.ndarray (H,W,C), valori 0–255
+            img_ = (self.X[idx]/255).astype(np.float32)      # np.ndarray (H,W,C), valori 0–255
+            img_gray = np.dot(img_[...,:3], [0.2989, 0.5870, 0.1140])
+            img = img_gray[..., np.newaxis].astype(np.float32)  # (H,W,1)
             raw = self.Y[idx]          # np.ndarray (H,W,1)
             msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
 
@@ -211,7 +269,7 @@ class NpyDataGenerator(keras.utils.Sequence):
             """"""
             # 2) zoom augmentations (4 seed diversi)
             for j in range(3):
-                seed = (idx, j)  # o qualunque combinazione di int
+                seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
                 xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
                 Xb[k] = xz
                 yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
@@ -256,7 +314,6 @@ val_IDs   = all_IDs[split:]
 train_gen = NpyDataGenerator(folds, train_IDs, batch_size=4, shuffle=True, mmap=True)
 val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=4, shuffle=False, mmap=True)
 
-model = build_unet_with_resnet50()
 #Dynamic Learning rate
 lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
         monitor='val_loss',
@@ -271,12 +328,12 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(
         histogram_freq=1,
         write_images=True
     )
-
+checkpoint_path='models/checkpoints/model_grayscale_v2.keras'
     # Checkpoint
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath=os.path.join('models','checkpoints','model_backbone.weights.h5'),
+        filepath=checkpoint_path,
         save_best_only=True,
-        save_weights_only=True,
+        #save_weights_only=True,
         monitor='val_loss',
         verbose=1
     )
@@ -289,9 +346,9 @@ earlystop_cb = tf.keras.callbacks.EarlyStopping(
     )
 #unfreeze_cb = UnfreezeCallback(unfreeze_epoch=1)
 Xb, Yb = train_gen[0]
-idx = np.random.randint(Xb.shape[0]-8)
+idx = np.random.randint(Xb.shape[0]-14)
 
-for i in range(idx,idx + 7):
+for i in range(idx,idx + 14):
     fig, axs = plt.subplots(2, 2, figsize=(6,6))
 
     axs[0,0].imshow(Xb[i],         vmin=0, vmax=1)                         # immagine normalizzata [0,1]
@@ -304,73 +361,76 @@ for i in range(idx,idx + 7):
 print("Xb shape:", Xb.shape, "dtype:", Xb.dtype)
 print("Yb shape:", Yb.shape, "dtype:", Yb.dtype)
 
+model = get_model_paper()
+
+model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=50,
+    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
+    verbose=1
+)
+"""
+model = build_unet_with_resnet50()
 for layer in model.backbone.layers:
     layer.trainable = False
 
-# Compilo con un LR “alto” per il solo decoder
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    optimizer=tf.keras.optimizers.Adam(1e-5),
     loss=bce_dice_loss,
     metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
 )
 
-# Alleno decoder per 5 epoche
 model.fit(
     train_gen,
     validation_data=val_gen,
     epochs=1,
-    batch_size=4,
-    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, lr_cb],
+    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
     verbose=1
 )
 
+# Salva i pesi migliori dai callback:
+
+# (assicurati che checkpoint_cb avesse save_weights_only=True e filepath=checkpoint_path)
+
+
+# ——— PULIZIA DELLA SESSIONE ———
+# questo svuota il grafo TF e libera la memoria GPU
 tf.keras.backend.clear_session()
 import gc; gc.collect()
 
-gpus = tf.config.list_physical_devices('GPU')
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu, True)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Limita l'uso della memoria GPU a 4 GB (ad esempio)
-        tf.config.set_logical_device_configuration(
-            gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=9500)]
-        )
-    except RuntimeError as e:
-        print(e)
+# RI-CONFIGURA la GPU (memory growth, visible devices, ecc.)
+#gpus = tf.config.list_physical_devices('GPU')
+#if gpus:
+#    for g in gpus:
+#        tf.config.experimental.set_memory_growth(g, True)
+#    # (opzionale) tf.config.set_visible_devices(gpus[0], 'GPU')
+
+# ——— FASE 2: fine-tuning ———
 model = build_unet_with_resnet50()
-
-check = os.path.join('models', 'checkpoints', 'model_backbone.weights.h5')
-    #X, Y = load_folds(folds=folds)
-
+# sblocca solo gli ultimi N layer
 model.backbone.trainable = True
 fine_tune_at = 100
-
-# 2) Ri‐congelo solo gli ultimi layer del backbone
 for i, layer in enumerate(model.backbone.layers):
     layer.trainable = (i >= fine_tune_at)
 
-model.load_weights(checkpoint_path=check)
+# carica i pesi dalla prima fase
+model.load_weights(checkpoint_path)
 
-# 3) Ricompilo con un LR molto più basso
+# ricompila con lr più basso
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6),
+    optimizer=tf.keras.optimizers.Adam(1e-6),
     loss=bce_dice_loss,
     metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
 )
 
-# 4) Riprendo il training da epoca 5 a 50
 model.fit(
     train_gen,
     validation_data=val_gen,
     initial_epoch=1,
     epochs=50,
-    batch_size=4,
-    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, lr_cb],
+    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
     verbose=1
 )
-
-
+"""
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)
