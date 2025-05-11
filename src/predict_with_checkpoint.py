@@ -19,7 +19,8 @@ if __name__ == "__main__":
     
     imgs_list = []
     masks_list = []
-    N = 12
+    types_list = []
+    N = 13
 
     for i, (img_path, mask_path) in enumerate(folds):
         print(f"i: {i}")
@@ -40,12 +41,18 @@ if __name__ == "__main__":
         imgs_list.append(imgs_selected)
         masks_list.append(masks_selected)
 
-        print(f"imgs_list: {len(imgs_list)}, masks_list: {len(masks_list)}")
+    print(f"imgs_list: {len(imgs_list)}, masks_list: {len(masks_list)}")
     
-    X = np.concatenate(imgs_list, axis=0) / 255 
-
+    X = np.concatenate(imgs_list, axis=0) 
+    X = X + 15
+    X = X/255
+    X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])
+    # e ricrea un canale singleton (se il tuo modello accetta input (H,W,1))
+    X = X_gray[..., np.newaxis].astype(np.float32)
+    
+    # adesso X ha shape (N,H,W,1)
     Xf = X.astype(np.float32)
-
+    print(f"Xf: {Xf.shape}")
     # 1) calcola la media per canale
     # se X ha shape (N,H,W,C):
     mean = Xf.mean(axis=(0,1,2), keepdims=True)
@@ -62,45 +69,29 @@ if __name__ == "__main__":
     else:
         Xc = np.clip(Xc, 0.0, 1.0)
 
-    Y = np.concatenate(masks_list, axis=0)
-    print(len(X),len(Y))
-
-    #fig, axs = plt.subplots(2,1)
-    #axs[0].imshow(X[1])
-    #axs[1].imshow(Y[1])
+    #plt.imshow(Xc[0,:,:,:])
     #plt.show()
+    Y = np.concatenate(masks_list, axis=0)
 
     checkp_base = os.path.join( 'models')
-    checkp_folds = os.path.join(checkp_base, 'checkpoints', 'model_paper_v5.keras')
-    check = os.path.join(checkp_base, 'checkpoints', 'model_grayscale.keras')
-    #X, Y = load_folds(folds=folds)
-    final = load_model(checkpoint_path=checkp_folds)
-    paper = load_model(checkpoint_path=check)
-    #Y = np.expand_dims(Y, axis=-1)
-    
+    check = os.path.join(checkp_base, 'checkpoints', 'model_grayscale_v3.keras')
 
+    paper = load_model(checkpoint_path=check)
+    
 
     X_train, X_test, Y_train, Y_test = train_test_split(
         Xc, Y, test_size=0.1, random_state=SEED)
-    
+    X_train_rgb = np.repeat(X_train, 3, axis=-1)
     thresholds = [0.3, 0.4, 0.5,0.6]
-    output = final.predict(X_train)
-    out = paper.predict(X_train)
+
+    out = paper.predict(X_train_rgb)
 
     pred_min = []
     pred = []
     predB = []
-    print(np.sum(output[0,:,:,0]),np.sum(output[0,:,:,1]),np.sum(output[0,:,:,2]))
+    
+    print(np.sum(out[0,:,:,0]),np.sum(out[0,:,:,1]),np.sum(out[0,:,:,2]))
 
-    cell_prob = np.maximum(output[0,:,:,0], output[0,:,:,1])
-    bg_prob   = output[0,:,:,1]
-
-# normalizza
-    total = cell_prob + bg_prob
-    cell_prob /= total
-    bg_prob   /= total
-
-    binary_mask = (cell_prob > bg_prob).astype(np.uint8)
 
     cell_prob1 = np.maximum(out[0,:,:,0], out[0,:,:,1])
     bg_prob1   = out[0,:,:,1]
@@ -112,32 +103,54 @@ if __name__ == "__main__":
 
     binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
 
-    for i in range(output.shape[0]): 
-        mask = (output[i,:,:,0]+output[i,:,:,2]>output[i,:,:,1])
-        B = (output[i,:,:,0]>output[i,:,:,2]) & (output[i,:,:,0]>output[i,:,:,1])
-        Border = (output[i,:,:,1]>output[i,:,:,0]) & (output[i,:,:,1]>output[i,:,:,2])
-        bin = mask.astype(np.uint8)
-        BM = B.astype(np.uint8)
-        Bord = Border.astype(np.uint8)
-        pred_min.append(bin)
-        pred.append(BM)
-        predB.append(Bord)
+#    for i in range(output.shape[0]): 
+#        mask = (output[i,:,:,0]+output[i,:,:,2]>output[i,:,:,1])
+#        B = (output[i,:,:,0]>output[i,:,:,2]) & (output[i,:,:,0]>output[i,:,:,1])
+#        Border = (output[i,:,:,1]>output[i,:,:,0]) & (output[i,:,:,1]>output[i,:,:,2])
+#        bin = mask.astype(np.uint8)
+#        BM = B.astype(np.uint8)
+#        Bord = Border.astype(np.uint8)
+#        pred_min.append(bin)
+#        pred.append(BM)
+#        predB.append(Bord)
 
+import cv2
 for i in range(X.shape[0]):
     fig, axs = plt.subplots(2,2,figsize=(8,8))
-    axs[0,0].imshow(X_train[i])
-    axs[0,1].imshow(Y_train[i], cmap='gray')
+    axs[0,0].imshow(X_train_rgb[i])
+    
+    thresh = (Y_train[i] > 0).astype(np.uint8) * 255
+    thresh_inv = 255 - thresh
+    # find contours
+    #label_img = img.copy()
+    contour_img1 = Y_train[i].copy()
+    contours, _ = cv2.findContours(thresh_inv, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    index = 1
+    isolated_count = 0
+    cluster_count = 0
+    contour_img1 = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    for cntr in contours:
+        if len(cntr) < 3:
+        # non c'è abbastanza geometria per un hull
+            continue
+        area = cv2.contourArea(cntr)
+        convex_hull = cv2.convexHull(cntr)
+        convex_hull_area = cv2.contourArea(convex_hull)
+        ratio = area / convex_hull_area
+
+        if ratio < 0.91:
+            # cluster contours in red
+            cv2.drawContours(contour_img1, [cntr], 0, (0,0,255), 2)
+            cluster_count = cluster_count + 1
+        else:
+            # isolated contours in green
+            cv2.drawContours(contour_img1, [cntr], 0, (0,255,0), 2)
+            isolated_count = isolated_count + 1
+        index = index + 1
+
+    print(f'GT: number_clusters: {cluster_count} -- number_isolated:{isolated_count}')
+    axs[0,1].imshow(contour_img1, cmap='gray')
     axs[0,1].set_title("GT")
-
-    cell_prob = np.maximum(output[i,:,:,0], output[i,:,:,1])
-    bg_prob   = output[i,:,:,1]
-
-# normalizza
-    total = cell_prob + bg_prob
-    cell_prob /= total
-    bg_prob   /= total
-
-    binary_mask = (cell_prob > bg_prob).astype(np.uint8)
 
     cell_prob1 = np.maximum(out[i,:,:,0], out[i,:,:,1])
     bg_prob1   = out[i,:,:,1]
@@ -148,17 +161,46 @@ for i in range(X.shape[0]):
     bg_prob1   /= total1
 
     binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
+    
+    binary_mask = binary_mask2[1:-1,1:-1]
+    # threshold to binary
+    thresh = (binary_mask > 0).astype(np.uint8) * 255
+    thresh_inv = 255 - thresh
+    # find contours
+    #label_img = img.copy()
+    contour_img = binary_mask.copy()
+    contours, _ = cv2.findContours(thresh_inv, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    index = 1
+    isolated_count = 0
+    cluster_count = 0
+    contour_img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    for cntr in contours:
+        if len(cntr) < 3:
+        # non c'è abbastanza geometria per un hull
+            continue
+        area = cv2.contourArea(cntr)
+        convex_hull = cv2.convexHull(cntr)
+        convex_hull_area = cv2.contourArea(convex_hull)
+        ratio = area / convex_hull_area
 
+        if ratio < 0.91:
+            # cluster contours in red
+            cv2.drawContours(contour_img, [cntr], 0, (0,0,255), 2)
+            cluster_count = cluster_count + 1
+        else:
+            # isolated contours in green
+            cv2.drawContours(contour_img, [cntr], 0, (0,255,0), 2)
+            isolated_count = isolated_count + 1
+        index = index + 1
+
+    print(f'Prediction: number_clusters: {cluster_count} -- number_isolated:{isolated_count}')
     axs[1,0].imshow(binary_mask2, cmap='gray')
     axs[1,0].set_title("Grayscale")
-    axs[1,1].imshow(binary_mask,cmap='gray')
-    axs[1,1].set_title("Colored")
+    axs[1,1].imshow(contour_img,  interpolation='nearest')
+    axs[1,1].set_title("CV2")
     plt.show()
 
-    
-    #morphological closing
-    #show_threshold_pairs_test(X_train,Y_train,Ptrain,thresholds=thresholds)
-    #show_threshold_pairs_test(X_train,Y_train,Ptrain,thresholds=thresholds)
+
 
 
     

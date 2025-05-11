@@ -213,7 +213,7 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     model.compile(
         optimizer=optimizer,
         loss=loss
-        #metrics=[OneHotMeanIoU(num_classes=3) ]
+        #metrics=[tf.keras.metrics.MeanIoU(num_classes=3) ]
     )
     
     return model
@@ -232,7 +232,10 @@ def build_unet_with_resnet50(input_shape=(256,256,3)):
     resnet = ResNet50(
         include_top=False,
         weights='imagenet',
-        input_tensor=inputs
+        input_tensor=inputs,
+        name='ResNet50',
+        classes=3,
+        classifier_activation='softmax'
     )
 
     # 3) Definisci i nomi dei layer di cui prendere gli skip

@@ -17,38 +17,11 @@ import tensorflow_io as tfio
 import cv2
 if __name__=="__main__":
     gpus = tf.config.list_physical_devices('GPU')
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-    gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        try:
-            # Limita l'uso della memoria GPU a 4 GB (ad esempio)
-            tf.config.set_logical_device_configuration(
-                gpus[0],
-                [tf.config.LogicalDeviceConfiguration(memory_limit=9500)]
-            )
-        except RuntimeError as e:
-            print(e)
+    # attiva memory growth **prima** di qualunque allocazione
+        tf.config.experimental.set_memory_growth(gpus[0], True)
     SEED = 42
     np.random.seed = SEED
-
-class UnfreezeCallback(tf.keras.callbacks.Callback):
-    def __init__(self, unfreeze_epoch):
-        super().__init__()
-        self.unfreeze_epoch = unfreeze_epoch
-        self.done = False
-
-    def on_epoch_begin(self, epoch, logs=None):
-        if not self.done and epoch == self.unfreeze_epoch:
-            print(f"\n>> Epoca {epoch}: scongelo tutto il backbone")
-            self.model.backbone.trainable = True
-
-            # crei anche i momenti m/v di Adam per i nuovi pesi
-            self.model.optimizer._create_all_weights(self.model.trainable_variables)
-
-            self.done = True
-
 
 class NpyDataGenerator(keras.utils.Sequence):
     def __init__(self,
@@ -163,71 +136,53 @@ class NpyDataGenerator(keras.utils.Sequence):
         return xz, yz
             """
     def augm(self,
-             seed: tuple[int,int],
-             img_np: np.ndarray,
-             mask_np: np.ndarray,
-             zoom_size: int,
-             IMG_SIZE: int
-            ) -> tuple[np.ndarray, np.ndarray]:
+         seed: tuple[int,int],
+         img_np: np.ndarray,
+         mask_np: np.ndarray,
+         zoom_size: int,
+         IMG_SIZE: int
+        ) -> tuple[np.ndarray, np.ndarray]:
         """
-        img_np: np.ndarray (H,W,1) o (H,W,3), valori 0–255 o già normalizzati
-        mask_np: np.ndarray (H,W)
+        img_np: np.ndarray (H,W) o (H,W,1) o (H,W,3), valori [0..1] o [0..255]
+        mask_np: np.ndarray (H,W), valori {0,1}
         """
-        # 1) Assicuriamoci uint8 [0–255] e 2D/3D coerente
-        #if img_np.dtype != np.uint8:
-        #    img_np = (img_np*255).clip(0,255).astype(np.uint8)
+        # 1) Assicuriamoci di avere (H,W,1) o (H,W,3)
         if img_np.ndim == 2:
             img_np = img_np[...,None]
-
-        # 2) Da numpy a tensor float32
+        # 2) Tensor float32
         img_t = tf.convert_to_tensor(img_np, dtype=tf.float32)
-        C     = img_t.shape[-1]
-        if C == 1:
+        C_orig = img_t.shape[-1]
+        # 3) Se mono-canale, duplichiamo su 3 canali
+        if C_orig == 1:
             img_t = tf.image.grayscale_to_rgb(img_t)
-            C     = 3
-
-        # 3) Pad per consentire il crop
+        # adesso img_t.shape == (H,W,3)
+        # 4) Pad/center-crop per avere shape statica (IMG_SIZE×IMG_SIZE×3)
         padded = tf.image.resize_with_crop_or_pad(img_t, IMG_SIZE, IMG_SIZE)
 
-        # 4) Genera un seed diverso per ogni chiamata (passato da fuori)
+        # 5) Preparo il seed TF
         seed_tf = tf.convert_to_tensor(seed, dtype=tf.int32)
-        margin = (zoom_size // 2) + 1  
-        padded_m = tf.pad(
-            img_t,
-            paddings=[[margin, margin],
-                      [margin, margin],
-                      [0, 0]],
-            mode='REFLECT'
-        )
-        # 5) Ritaglio vero e proprio (random crop)
+
+        # 6) Random crop **dal padded**, taglio un quadrato zoom_size×zoom_size×3
         crop = tf.image.stateless_random_crop(
-            padded_m,
-            size=[zoom_size, zoom_size, C],
+            padded,
+            size=[zoom_size, zoom_size, 3],
             seed=seed_tf
         )
-
-        # 6) Ridimensiono il ritaglio a IMG_SIZE
+        # 7) Ridimensiono back a IMG_SIZE×IMG_SIZE
         xz = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE])
-# pad riflettente ai bordi
-        # 7) Stessa cosa per la mask
+
+        # 8) Stessa cosa per la mask (ha sempre 1 canale)
         mask_t = tf.convert_to_tensor(mask_np[...,None], dtype=tf.float32)
         padded_m = tf.image.resize_with_crop_or_pad(mask_t, IMG_SIZE, IMG_SIZE)
-        padded = tf.pad(
-            mask_t,
-            paddings=[[margin, margin],
-                      [margin, margin],
-                      [0, 0]],
-            mode='REFLECT'
-        )
-        crop_m   = tf.image.stateless_random_crop(
-            padded,
+        crop_m = tf.image.stateless_random_crop(
+            padded_m,
             size=[zoom_size, zoom_size, 1],
             seed=seed_tf
         )
         yz = tf.image.resize(crop_m, [IMG_SIZE, IMG_SIZE])
 
-        # 8) Da tensor a numpy
-        xz_np = xz.numpy().astype(np.float32)   # /255 se ti serve [0,1]
+        # 9) Torno a NumPy
+        xz_np = xz.numpy().astype(np.float32)
         yz_np = yz.numpy().astype(np.uint8)
 
         return xz_np, yz_np
@@ -243,12 +198,12 @@ class NpyDataGenerator(keras.utils.Sequence):
 
     def __data_generation(self, list_temp):
         # numero di augmentazioni per sample
-        n_aug =  6  # 4 zoom + flipLR + flipUD, ad esempio
+        n_aug =  5  # 4 zoom + flipLR + flipUD, ad esempio
         batch_n = len(list_temp) * n_aug
 
         # dimensioni immagine
         H, W, C = self.X.shape[1:] if self.patch_size is None else (self.patch_size,)*2 + (self.X.shape[-1],)
-
+        
         # pre-allocazione
         Xb = np.empty((batch_n, H, W, C), dtype=np.float32)
         Yb = np.empty((batch_n, H, W, 3),   dtype=np.uint8)
@@ -256,9 +211,13 @@ class NpyDataGenerator(keras.utils.Sequence):
         k = 0   # contatore totale delle righe di Xb/Yb
 
         for idx in list_temp:
-            img_ = (self.X[idx]/255).astype(np.float32)      # np.ndarray (H,W,C), valori 0–255
+            img_ = (self.X[idx]).astype(np.float32)
+            img_ = img_ + 15
+            img_ = img_ / 255      # np.ndarray (H,W,C), valori 0–255
             img_gray = np.dot(img_[...,:3], [0.2989, 0.5870, 0.1140])
             img = img_gray[..., np.newaxis].astype(np.float32)  # (H,W,1)
+            
+            #print(img.shape)
             raw = self.Y[idx]          # np.ndarray (H,W,1)
             msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
 
@@ -268,7 +227,7 @@ class NpyDataGenerator(keras.utils.Sequence):
             k += 1
             """"""
             # 2) zoom augmentations (4 seed diversi)
-            for j in range(3):
+            for j in range(2):
                 seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
                 xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
                 Xb[k] = xz
@@ -315,25 +274,21 @@ train_gen = NpyDataGenerator(folds, train_IDs, batch_size=4, shuffle=True, mmap=
 val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=4, shuffle=False, mmap=True)
 
 #Dynamic Learning rate
-lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=5,
-        min_lr=1e-6,
-        verbose=1
-        )
+reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5
+)
 
 tensorboard_cb = tf.keras.callbacks.TensorBoard(
         log_dir=os.path.join('logs','fit'),
         histogram_freq=1,
         write_images=True
     )
-checkpoint_path='models/checkpoints/model_grayscale_v2.keras'
+checkpoint_path='models/checkpoints/model_grayscale_v3.keras'
     # Checkpoint
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         save_best_only=True,
-        #save_weights_only=True,
+        save_weights_only=False,
         monitor='val_loss',
         verbose=1
     )
@@ -341,96 +296,115 @@ checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
     # EarlyStopping
 earlystop_cb = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
-        patience=4,
+        patience=5,
         verbose=1
     )
 #unfreeze_cb = UnfreezeCallback(unfreeze_epoch=1)
 Xb, Yb = train_gen[0]
 idx = np.random.randint(Xb.shape[0]-14)
-
+"""
 for i in range(idx,idx + 14):
     fig, axs = plt.subplots(2, 2, figsize=(6,6))
 
-    axs[0,0].imshow(Xb[i],         vmin=0, vmax=1)                         # immagine normalizzata [0,1]
+    axs[0,0].imshow(Xb[i], cmap='gray',        vmin=0, vmax=1)                         # immagine normalizzata [0,1]
     axs[0,1].imshow(Yb[i,:,:,0], cmap='gray', vmin=0, vmax=1)  # body
     axs[1,0].imshow(Yb[i,:,:,1], cmap='gray', vmin=0, vmax=1)  # background
     axs[1,1].imshow(Yb[i,:,:,2], cmap='gray', vmin=0, vmax=1)  # border
 
     plt.tight_layout()
     plt.show()
+"""
 print("Xb shape:", Xb.shape, "dtype:", Xb.dtype)
 print("Yb shape:", Yb.shape, "dtype:", Yb.dtype)
 
+mean = Xb.mean(axis=(0,1,2), keepdims=True)
+    # se X è singola immagine (H,W,C), usa mean = Xf.mean(axis=(0,1), keepdims=True)
+
+alpha = 1.4  # >1 aumenta il contrasto
+# 2) formula del contrast stretch
+Xc = mean + alpha * (Xb - mean)
+# 3) ritaglia al range originale
+if Xb.dtype == np.uint8:
+    Xc = np.clip(Xc, 0, 255).astype(np.uint8)
+else:
+    Xc = np.clip(Xc, 0.0, 1.0)
+
 model = get_model_paper()
 
-model.fit(
-    train_gen,
-    validation_data=val_gen,
-    epochs=50,
-    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
-    verbose=1
-)
+model.fit(train_gen,
+        validation_data=val_gen, 
+        epochs=50, 
+        callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+        verbose=1)
 """
-model = build_unet_with_resnet50()
-for layer in model.backbone.layers:
-    layer.trainable = False
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
 
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(1e-5),
-    loss=bce_dice_loss,
-    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
-)
+stage_names = [
+        'conv1_relu',           
+        'conv2_block3_out',   
+        'conv3_block4_out',   
+        'conv4_block6_out',]
 
-model.fit(
-    train_gen,
-    validation_data=val_gen,
-    epochs=1,
-    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
-    verbose=1
-)
+range_epochs = [5,10,10]
 
-# Salva i pesi migliori dai callback:
+lr_sh = [1e-5, 5e-6, 1e-6]
+initial_epoch = 0
+for iteration in range(3):
+    model = tf.keras.models.load_model(
+    f'models/checkpoints/model_backbone_v4_{iteration}.keras',
+    custom_objects={'bce_dice_loss': bce_dice_loss}
+    )
+    print(f"lr:{lr_sh[iteration]} -- model: models/checkpoints/model_backbone_v4_{iteration}.keras\n")
+    bottleneck_name = stage_names[-iteration]
+    bottleneck_tensor = model.get_layer(name=bottleneck_name).output
 
-# (assicurati che checkpoint_cb avesse save_weights_only=True e filepath=checkpoint_path)
+    encoder = Model(inputs=model.input, outputs=bottleneck_tensor)
+    # 4) encoder.layers contiene tutti i Layer di ResNet50
+    print(f"Encoder layers: {len(encoder.layers)}")
 
+    k=0
+    for l in encoder.layers:
+        if l.name==stage_names[-iteration]:
+            break
+        k+=1
+    print(f"K:{k}")
+    for l in encoder.layers[k:]:
+        l.trainable=True
+    unfreeze_from = stage_names[iteration+1]
 
-# ——— PULIZIA DELLA SESSIONE ———
-# questo svuota il grafo TF e libera la memoria GPU
-tf.keras.backend.clear_session()
-import gc; gc.collect()
+    # trova l'indice all'interno di encoder.layers
+    idx = next(i for i,l in enumerate(encoder.layers)
+               if l.name == unfreeze_from)
+    print(f"\nIter {iteration}: unfreeze from '{unfreeze_from}' (layer #{idx})")
 
-# RI-CONFIGURA la GPU (memory growth, visible devices, ecc.)
-#gpus = tf.config.list_physical_devices('GPU')
-#if gpus:
-#    for g in gpus:
-#        tf.config.experimental.set_memory_growth(g, True)
-#    # (opzionale) tf.config.set_visible_devices(gpus[0], 'GPU')
+    # 2) frozen tutto fino a idx (escluso), trainable da idx in poi
+    for j, layer in enumerate(encoder.layers):
+        layer.trainable = (j >= idx)
+    # 5) Ora fai il tuo freeze/unfreeze sui primi stage
+    #k = unfreeze_counts[3]   # quanti layer vuoi sbloccare in questo stage
+    #for layer in encoder.layers[:-k]:
+    #    layer.trainable = False
+    #for layer in encoder.layers[-k:]:
+    #    layer.trainable = True
 
-# ——— FASE 2: fine-tuning ———
-model = build_unet_with_resnet50()
-# sblocca solo gli ultimi N layer
-model.backbone.trainable = True
-fine_tune_at = 100
-for i, layer in enumerate(model.backbone.layers):
-    layer.trainable = (i >= fine_tune_at)
-
-# carica i pesi dalla prima fase
-model.load_weights(checkpoint_path)
-
-# ricompila con lr più basso
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(1e-6),
-    loss=bce_dice_loss,
-    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
-)
-
-model.fit(
-    train_gen,
-    validation_data=val_gen,
-    initial_epoch=1,
-    epochs=50,
-    callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
-    verbose=1
-)
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+        filepath=f'models/checkpoints/model_backbone_v4_{iteration+1}.keras',
+        save_best_only=True,
+        save_weights_only=False,
+        monitor='val_loss',
+        verbose=1
+    )
+    
+    model.compile(Adam(lr_sh[iteration]), loss=bce_dice_loss, metrics=[tf.keras.metrics.MeanIoU(num_classes=3)])
+    model.summary()
+    model.fit(train_gen,
+        validation_data=val_gen, 
+        initial_epoch=initial_epoch,
+        epochs=range_epochs[iteration]+initial_epoch, 
+        callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+        verbose=1)
+    
+    initial_epoch = range_epochs[iteration]+initial_epoch
 """
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)
