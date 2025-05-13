@@ -14,6 +14,7 @@ import math
 from src.losses import csca_binary_loss, bce_dice_loss
 from tensorflow import keras 
 import tensorflow_io as tfio
+import segmentation_models as sm
 import cv2
 if __name__=="__main__":
     gpus = tf.config.list_physical_devices('GPU')
@@ -22,7 +23,7 @@ if __name__=="__main__":
         tf.config.experimental.set_memory_growth(gpus[0], True)
     SEED = 42
     np.random.seed = SEED
-
+BACKBONE = 'resnet34'
 class NpyDataGenerator(keras.utils.Sequence):
     def __init__(self,
                  folds: list[tuple[str,str]],
@@ -146,6 +147,8 @@ class NpyDataGenerator(keras.utils.Sequence):
         img_np: np.ndarray (H,W) o (H,W,1) o (H,W,3), valori [0..1] o [0..255]
         mask_np: np.ndarray (H,W), valori {0,1}
         """
+        if mask_np.ndim == 3 and mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
         # 1) Assicuriamoci di avere (H,W,1) o (H,W,3)
         if img_np.ndim == 2:
             img_np = img_np[...,None]
@@ -206,7 +209,7 @@ class NpyDataGenerator(keras.utils.Sequence):
         
         # pre-allocazione
         Xb = np.empty((batch_n, H, W, C), dtype=np.float32)
-        Yb = np.empty((batch_n, H, W, 3),   dtype=np.uint8)
+        Yb = np.empty((batch_n, H, W, 1),   dtype=np.float32)#"""uint8"""
 
         k = 0   # contatore totale delle righe di Xb/Yb
 
@@ -219,35 +222,36 @@ class NpyDataGenerator(keras.utils.Sequence):
             
             #print(img.shape)
             raw = self.Y[idx]          # np.ndarray (H,W,1)
-            msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
+            #msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
 
             # 1) originale
             Xb[k] = img.astype(np.float32)
-            Yb[k] = self._make_target_3ch(msk)
+            Yb[k] = raw#self._make_target_3ch(msk)
             k += 1
             """"""
             # 2) zoom augmentations (4 seed diversi)
             for j in range(2):
                 seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
-                xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
+                xz, yz = self.augm(seed, img, raw, zoom_size=180, IMG_SIZE=256)
                 Xb[k] = xz
-                yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
-                Yb[k] = self._make_target_3ch(yz_)
+                #yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
+                Yb[k] = yz#self._make_target_3ch(yz_)
                 k += 1
             # 3) flip left–right
             img_lr = np.fliplr(img)
-            mask_lr = np.fliplr(msk)
+            mask_lr = np.fliplr(raw)
             Xb[k] = img_lr.astype(np.float32)
-            Yb[k] = self._make_target_3ch(mask_lr)
+            Yb[k] = mask_lr#self._make_target_3ch(mask_lr)
             k += 1
 
             # 4) flip up–down
             img_ud = np.flipud(img)
-            mask_ud= np.flipud(msk)
+            mask_ud= np.flipud(raw)
             Xb[k] = img_ud.astype(np.float32)
-            Yb[k] = self._make_target_3ch(mask_ud)
+            Yb[k] = mask_ud#self._make_target_3ch(mask_ud)
             k += 1
-
+        preprocess_input = sm.get_preprocessing(BACKBONE)
+        Xb = preprocess_input(Xb)
         return Xb, Yb
 
 
@@ -329,6 +333,30 @@ if Xb.dtype == np.uint8:
 else:
     Xc = np.clip(Xc, 0.0, 1.0)
 
+
+os.environ["SM_FRAMEWORK"] = "tf.keras"
+#BACKBONE = 'resnet34'
+#preprocess_input = sm.get_preprocessing(BACKBONE)
+
+
+# define model
+model = sm.Unet(BACKBONE, encoder_weights='imagenet')
+model.compile(
+    'Adam',
+    loss=sm.losses.bce_jaccard_loss,
+    metrics=[sm.metrics.iou_score],
+)
+
+# fit model
+# if you use data generator use model.fit_generator(...) instead of model.fit(...)
+# more about `fit_generator` here: https://keras.io/models/sequential/#fit_generator
+model.fit(train_gen,
+        validation_data=val_gen,
+        batch_size=4,
+        epochs=30
+)
+model.save('backbone_test.hdf5')
+"""
 model = get_model_paper()
 
 model.fit(train_gen,
@@ -336,75 +364,5 @@ model.fit(train_gen,
         epochs=50, 
         callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
         verbose=1)
-"""
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.models import Model
-
-stage_names = [
-        'conv1_relu',           
-        'conv2_block3_out',   
-        'conv3_block4_out',   
-        'conv4_block6_out',]
-
-range_epochs = [5,10,10]
-
-lr_sh = [1e-5, 5e-6, 1e-6]
-initial_epoch = 0
-for iteration in range(3):
-    model = tf.keras.models.load_model(
-    f'models/checkpoints/model_backbone_v4_{iteration}.keras',
-    custom_objects={'bce_dice_loss': bce_dice_loss}
-    )
-    print(f"lr:{lr_sh[iteration]} -- model: models/checkpoints/model_backbone_v4_{iteration}.keras\n")
-    bottleneck_name = stage_names[-iteration]
-    bottleneck_tensor = model.get_layer(name=bottleneck_name).output
-
-    encoder = Model(inputs=model.input, outputs=bottleneck_tensor)
-    # 4) encoder.layers contiene tutti i Layer di ResNet50
-    print(f"Encoder layers: {len(encoder.layers)}")
-
-    k=0
-    for l in encoder.layers:
-        if l.name==stage_names[-iteration]:
-            break
-        k+=1
-    print(f"K:{k}")
-    for l in encoder.layers[k:]:
-        l.trainable=True
-    unfreeze_from = stage_names[iteration+1]
-
-    # trova l'indice all'interno di encoder.layers
-    idx = next(i for i,l in enumerate(encoder.layers)
-               if l.name == unfreeze_from)
-    print(f"\nIter {iteration}: unfreeze from '{unfreeze_from}' (layer #{idx})")
-
-    # 2) frozen tutto fino a idx (escluso), trainable da idx in poi
-    for j, layer in enumerate(encoder.layers):
-        layer.trainable = (j >= idx)
-    # 5) Ora fai il tuo freeze/unfreeze sui primi stage
-    #k = unfreeze_counts[3]   # quanti layer vuoi sbloccare in questo stage
-    #for layer in encoder.layers[:-k]:
-    #    layer.trainable = False
-    #for layer in encoder.layers[-k:]:
-    #    layer.trainable = True
-
-    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath=f'models/checkpoints/model_backbone_v4_{iteration+1}.keras',
-        save_best_only=True,
-        save_weights_only=False,
-        monitor='val_loss',
-        verbose=1
-    )
-    
-    model.compile(Adam(lr_sh[iteration]), loss=bce_dice_loss, metrics=[tf.keras.metrics.MeanIoU(num_classes=3)])
-    model.summary()
-    model.fit(train_gen,
-        validation_data=val_gen, 
-        initial_epoch=initial_epoch,
-        epochs=range_epochs[iteration]+initial_epoch, 
-        callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
-        verbose=1)
-    
-    initial_epoch = range_epochs[iteration]+initial_epoch
 """
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)
