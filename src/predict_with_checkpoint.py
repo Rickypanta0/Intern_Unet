@@ -74,7 +74,7 @@ if __name__ == "__main__":
     Y = np.concatenate(masks_list, axis=0)
 
     checkp_base = os.path.join( 'models')
-    check = os.path.join(checkp_base, 'checkpoints', 'backbone_test.hdf5')
+    check = os.path.join(checkp_base, 'checkpoints', 'model_grayscale_v3.keras')
 
     paper = load_model(checkpoint_path=check)
     
@@ -146,26 +146,25 @@ for i in range(X.shape[0]):
             isolated_count = isolated_count + 1
         index = index + 1
 
-    binary_mask = (out[i]>0.5).astype(np.uint8)
+    #binary_mask = (out[i]>0.5).astype(np.uint8)
     print(f'GT: number_clusters: {cluster_count} -- number_isolated:{isolated_count}')
 
-#    cell_prob1 = np.maximum(out[i,:,:,0], out[i,:,:,1])
-#    bg_prob1   = out[i,:,:,1]
+    cell_prob1 = np.maximum(out[i,:,:,0], out[i,:,:,1])
+    bg_prob1   = out[i,:,:,1]
+ #normalizza
+    total1 = cell_prob1 + bg_prob1
+    cell_prob1 /= total1
+    bg_prob1   /= total1
 
-# normalizza
-#    total1 = cell_prob1 + bg_prob1
-#    cell_prob1 /= total1
-#    bg_prob1   /= total1
-#
-#    binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
-#    
-#    binary_mask = binary_mask2[1:-1,1:-1]
+    binary_mask2 = (cell_prob1 > bg_prob1).astype(np.uint8)
+    
+    binary_mask = binary_mask2[1:-1,1:-1]
     # threshold to binary
     
     from scipy import ndimage as ndi
     from skimage.segmentation import watershed
     from skimage.feature import peak_local_max
-
+    print(binary_mask.shape)
     img_norm = cv2.normalize(binary_mask, None, 0,255, cv2.NORM_MINMAX)
     img_8u = img_norm.astype(np.uint8)
     ret, thresh = cv2.threshold(img_8u, 0, 255,
@@ -180,14 +179,14 @@ for i in range(X.shape[0]):
                 distance,
                 footprint=np.ones((3,3)),
                 labels=image,
-                min_distance=1
+                min_distance=12
                 )
 
     mask = np.zeros(distance.shape, dtype=bool)
     mask[tuple(coords.T)] = True
     markers, _ = ndi.label(mask)
 
-    labels = watershed(-distance, markers, mask=image)
+    labels = watershed(-distance, markers, mask=image, connectivity=2)
 
     contour_img = cv2.cvtColor(opening, cv2.COLOR_GRAY2BGR)
     isolated_count = 0
@@ -222,13 +221,75 @@ for i in range(X.shape[0]):
             isolated_count = isolated_count + 1
         index = index + 1
         #cv2.drawContours(contour_img, [cntr], -1, color, 2)
+    #fig, axes = plt.subplots(2,3, figsize=(8, 8), sharex=True, sharey=True)
+
+    img_norm = cv2.normalize(binary_mask, None, 0, 255, cv2.NORM_MINMAX)
+    img_8u   = img_norm.astype(np.uint8)
+    ret, thresh = cv2.threshold(img_8u,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+    
+    kernel = np.ones((3,3),np.uint8)
+    opening = cv2.morphologyEx(thresh,cv2.MORPH_OPEN,kernel, iterations = 2)
+
+    # sure background area
+    sure_bg = cv2.dilate(opening,kernel,iterations=3)
+    
+    # Finding sure foreground area
+    dist_transform = cv2.distanceTransform(opening,cv2.DIST_L2,5)
+    cv2.normalize(dist_transform, dist_transform, 0, 1.0, cv2.NORM_MINMAX)
+    ret, sure_fg = cv2.threshold(dist_transform,0.1*dist_transform.max(),255,0)
+
+    # Finding unknown region
+    sure_fg = np.uint8(sure_fg)
+    unknown = cv2.subtract(sure_bg,sure_fg)
+
+    #struct = np.ones((3,3), dtype=bool)
+    #sure_fg_ = binary_erosion(sure_fg, structure=struct).astype(np.uint8)
+
+    ret, markers = cv2.connectedComponents(sure_fg)
+ 
+    # Add one to all labels so that sure background is not 0, but 1
+    markers = markers+1
+    
+    # Now, mark the region of unknown with zero
+    markers[unknown==255] = 0
+    img8 = X_train[i]
+    print(">> img8:", img8.shape, img8.dtype)
+    print(">> markers:", markers.shape, markers.dtype)
+    gray = img8
+    if gray.ndim == 3 and gray.shape[-1] == 1:
+        gray = gray[..., 0]   # ora shape (H,W)
+
+    # 2) Passiamo a uint8 [0..255]
+    if gray.dtype != np.uint8:
+        # se è normalizzato in [0,1]
+        if gray.max() <= 1.0:
+            gray_u8 = (gray * 255).astype(np.uint8)
+        else:
+            gray_u8 = gray.astype(np.uint8)
+    else:
+        gray_u8 = gray
+
+    # 3) Da grayscale a BGR 3-canali
+    img_bgr = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+
+    # 4) Marker come int32 single-channel
+    markers32 = markers.astype(np.int32)
+
+    # 2) Assicurati che i marker siano int32 single-channel
+    markers32 = markers.astype(np.int32)
+    print(">> img_color:", img_bgr.shape, img_bgr.dtype)
+    print(">> markers32:", markers32.shape, markers32.dtype)
+    img_bgr = img_bgr[1:-1,1:-1]
+    markers_ = cv2.watershed(img_bgr,markers32)
+    img_bgr[markers == -1] = [255,0,0]
+    
     fig, axes = plt.subplots(2,3, figsize=(8, 8), sharex=True, sharey=True)
 
     axes[0,0].imshow(X_train[i],cmap='gray')
     axes[0,0].set_title('Image')
-    axes[0,1].imshow(Y_train[i], cmap=plt.cm.gray)
-    axes[0,1].set_title('GT')
-    axes[0,2].imshow(contour_img1)
+    axes[0,1].imshow(markers_, cmap=plt.cm.nipy_spectral)
+    axes[0,1].set_title('watershed a')
+    axes[0,2].imshow(markers)
     axes[0,2].set_title('Count GT (No watershed)')
     axes[1,0].imshow(opening, cmap=plt.cm.gray)
     axes[1,0].set_title('BinaryMask pred')
