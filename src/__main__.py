@@ -15,6 +15,7 @@ from src.losses import csca_binary_loss, bce_dice_loss
 from tensorflow import keras 
 import tensorflow_io as tfio
 import segmentation_models as sm
+from src.test_augm import build_instance_map_valuewise, GenInstanceHV
 import cv2
 if __name__=="__main__":
     gpus = tf.config.list_physical_devices('GPU')
@@ -44,12 +45,15 @@ class NpyDataGenerator(keras.utils.Sequence):
         loader = lambda p: np.load(p, mmap_mode='r') if mmap else np.load(p)
         X_list = []
         Y_list = []
-        for img_npy, mask_npy in folds:
+        Z_list = []
+        for img_npy, mask_npy, mask_multi_ch in folds:
             X_list.append(loader(img_npy))
             Y_list.append(loader(mask_npy))
+            Z_list.append(loader(mask_multi_ch))
         # concatenazione
         self.X = np.concatenate(X_list, axis=0)
         self.Y = np.concatenate(Y_list, axis=0)[...,None]  # aggiunge canale
+        self.Z = np.concatenate(Z_list, axis=0)
         self.n_samples = self.X.shape[0]
 
         self.list_IDs   = list_IDs
@@ -71,71 +75,7 @@ class NpyDataGenerator(keras.utils.Sequence):
         self.indexes = np.arange(len(self.list_IDs))
         if self.shuffle:
             np.random.shuffle(self.indexes)
-    """
-    def augm(self,
-         seed: tuple[int,int],
-         img_np: np.ndarray,
-         mask_np: np.ndarray,
-         zoom_size: int,
-         IMG_SIZE: int
-        ) -> tuple[np.ndarray, np.ndarray]:
-        
-        img_np: numpy array, shape (H,W,1) o (H,W,3), valori 0–255 o già normalizzati
-        mask_np: numpy array, shape (H,W)
-        
 
-        # 1) Normalizza e porta a float32
-        # Se è (H,W) → (H,W,1)
-        if img_np.ndim == 2:
-            img_np = img_np[..., np.newaxis]
-
-        # 2) TensorFlow tensor
-        img_t = tf.convert_to_tensor(img_np, dtype=tf.float32)  # shape (H,W,C)
-
-        # 3) Se è single-channel, duplica in RGB
-        C = int(img_np.shape[-1])             # 1 o 3
-
-        if C == 1:
-            img_t = tf.image.grayscale_to_rgb(img_t)            # ora (H,W,3)
-            C = 3
-
-        # 4) Padding
-        padded = tf.image.resize_with_crop_or_pad(img_t, IMG_SIZE + 6, IMG_SIZE + 6)
-
-        # 5) Stateless random crop, usando C canali
-        seed_tf = tf.convert_to_tensor(seed, dtype=tf.int32)
-        seed0   = tf.random.experimental.stateless_split(seed_tf, num=1)[0]
-        crop    = tf.image.stateless_random_crop(
-            padded,
-            size=[zoom_size, zoom_size, C],
-            seed=seed0
-        )
-
-        # 6) Zoom-centered pad
-        zoomed_padded = tf.image.resize(
-            tf.image.central_crop(padded, central_fraction=zoom_size/IMG_SIZE),
-            [IMG_SIZE, IMG_SIZE]
-        )
-
-        # 7) Stessa logica per la mask (sempre 1 canale)
-        mask_t = tf.expand_dims(tf.convert_to_tensor(mask_np, dtype=tf.float32), axis=-1)
-        padded_m = tf.image.resize_with_crop_or_pad(mask_t, IMG_SIZE + 6, IMG_SIZE + 6)
-        crop_m   = tf.image.stateless_random_crop(
-            padded_m,
-            size=[zoom_size, zoom_size, 1],
-            seed=seed0
-        )
-        zoomed_padded_m = tf.image.resize(
-            tf.image.central_crop(padded_m, central_fraction=zoom_size/IMG_SIZE),
-            [IMG_SIZE, IMG_SIZE]
-        )
-
-        # 8) Torna a NumPy
-        xz = zoomed_padded.numpy().astype(np.float32)
-        yz = zoomed_padded_m.numpy().astype(np.uint8)
-
-        return xz, yz
-            """
     def augm(self,
          seed: tuple[int,int],
          img_np: np.ndarray,
@@ -201,7 +141,7 @@ class NpyDataGenerator(keras.utils.Sequence):
 
     def __data_generation(self, list_temp):
         # numero di augmentazioni per sample
-        n_aug =  5  # 4 zoom + flipLR + flipUD, ad esempio
+        n_aug =  3  # 4 zoom + flipLR + flipUD, ad esempio
         batch_n = len(list_temp) * n_aug
 
         # dimensioni immagine
@@ -209,7 +149,8 @@ class NpyDataGenerator(keras.utils.Sequence):
         
         # pre-allocazione
         Xb = np.empty((batch_n, H, W, C), dtype=np.float32)
-        Yb = np.empty((batch_n, H, W, 1),   dtype=np.float32)#"""uint8"""
+        Yb = np.empty((batch_n, H, W, 3),   dtype=np.float32)#"""uint8"""
+        HVb = np.empty((batch_n, H, W, 2), dtype=np.float32)
 
         k = 0   # contatore totale delle righe di Xb/Yb
 
@@ -220,51 +161,69 @@ class NpyDataGenerator(keras.utils.Sequence):
             img_gray = np.dot(img_[...,:3], [0.2989, 0.5870, 0.1140])
             img = img_gray[..., np.newaxis].astype(np.float32)  # (H,W,1)
             
+            hv_map = self.Z[idx]  # shape (H,W,6)
+            #instance_map = build_instance_map_valuewise(mask_6ch)  # definita prima
+            #img_input = instance_map[..., np.newaxis]
+#
+            ## HV map tramite GenInstanceHV
+            #gen = GenInstanceHV(crop_shape=instance_map.shape)
+            #img_out = gen._augment(img_input, None)
+            #hv_map = img_out[..., 1:3]  # (H,W,2)
+
             #print(img.shape)
             raw = self.Y[idx]          # np.ndarray (H,W,1)
-            #msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
+            msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
 
             # 1) originale
             Xb[k] = img.astype(np.float32)
-            Yb[k] = raw#self._make_target_3ch(msk)
+            Yb[k] = self._make_target_3ch(msk)
+            HVb[k] = hv_map
             k += 1
             """"""
             # 2) zoom augmentations (4 seed diversi)
-            for j in range(2):
-                seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
-                xz, yz = self.augm(seed, img, raw, zoom_size=180, IMG_SIZE=256)
-                Xb[k] = xz
-                #yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
-                Yb[k] = yz#self._make_target_3ch(yz_)
-                k += 1
+            #for j in range(1):
+            #    seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
+            #    xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
+            #    Xb[k] = xz
+            #    yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
+            #    
+            #    Yb[k] = self._make_target_3ch(yz_)
+            #    k += 1
             # 3) flip left–right
             img_lr = np.fliplr(img)
-            mask_lr = np.fliplr(raw)
+            mask_lr = np.fliplr(msk)
+            hv_map_lr = np.fliplr(hv_map)
             Xb[k] = img_lr.astype(np.float32)
-            Yb[k] = mask_lr#self._make_target_3ch(mask_lr)
+            Yb[k] = self._make_target_3ch(mask_lr)
+            HVb[k] = hv_map_lr
             k += 1
 
             # 4) flip up–down
             img_ud = np.flipud(img)
-            mask_ud= np.flipud(raw)
+            mask_ud= np.flipud(msk)
+            hv_map_ud= np.flipud(hv_map)
             Xb[k] = img_ud.astype(np.float32)
-            Yb[k] = mask_ud#self._make_target_3ch(mask_ud)
+            Yb[k] = self._make_target_3ch(mask_ud)
+            HVb[k] = hv_map_ud
             k += 1
         preprocess_input = sm.get_preprocessing(BACKBONE)
         Xb = preprocess_input(Xb)
-        return Xb, Yb
+        return Xb, {'seg_head': Yb, 'hv_head': HVb}
 
 
 
 base = os.path.join( 'data','raw')
 folds = [
     (os.path.join(base, 'Fold 1', 'images', 'fold1', 'images.npy'),
-     os.path.join(base, 'Fold 1', 'masks', 'fold1', 'binary_masks.npy')),
+     os.path.join(base, 'Fold 1', 'masks', 'fold1', 'binary_masks.npy'),
+     os.path.join(base, 'Fold 1', 'masks', 'fold1', 'distance.npy')),
      (os.path.join(base, 'Fold 3', 'images', 'fold3', 'images.npy'),
-     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy')),
-    (os.path.join(base, 'Fold 2', 'images', 'fold2', 'images.npy'),
-     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'binary_masks.npy'))
-]
+     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy'),
+     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'distance.npy'))]
+#    (os.path.join(base, 'Fold 2', 'images', 'fold2', 'images.npy'),
+#     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'binary_masks.npy'),
+#     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'masks.npy'))
+#]
 
 
 num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
@@ -287,7 +246,7 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(
         histogram_freq=1,
         write_images=True
     )
-checkpoint_path='models/checkpoints/model_grayscale_v3.keras'
+checkpoint_path='models/checkpoints/model_grayscale_HV.keras'
     # Checkpoint
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
@@ -305,22 +264,23 @@ earlystop_cb = tf.keras.callbacks.EarlyStopping(
     )
 #unfreeze_cb = UnfreezeCallback(unfreeze_epoch=1)
 Xb, Yb = train_gen[0]
-idx = np.random.randint(Xb.shape[0]-14)
-"""
-for i in range(idx,idx + 14):
+#idx = np.random.randint(Xb.shape[0]-14)
+idx = 0
+print(Xb.shape)
+for i in range(idx,idx + 5):
     fig, axs = plt.subplots(2, 2, figsize=(6,6))
+    image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+    mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
+    body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
 
-    axs[0,0].imshow(Xb[i], cmap='gray',        vmin=0, vmax=1)                         # immagine normalizzata [0,1]
-    axs[0,1].imshow(Yb[i,:,:,0], cmap='gray', vmin=0, vmax=1)  # body
-    axs[1,0].imshow(Yb[i,:,:,1], cmap='gray', vmin=0, vmax=1)  # background
-    axs[1,1].imshow(Yb[i,:,:,2], cmap='gray', vmin=0, vmax=1)  # border
+    axs[0,0].imshow(Xb[i,...,0])                         # immagine normalizzata [0,1]
+    axs[0,1].imshow(body_mask,  vmin=0, vmax=1)  # body
+    axs[1,0].imshow(Yb['hv_head'][i, ..., 0])  # background
+    axs[1,1].imshow(Yb['hv_head'][i, ..., 1])  # border
 
     plt.tight_layout()
     plt.show()
 """
-print("Xb shape:", Xb.shape, "dtype:", Xb.dtype)
-print("Yb shape:", Yb.shape, "dtype:", Yb.dtype)
-
 mean = Xb.mean(axis=(0,1,2), keepdims=True)
     # se X è singola immagine (H,W,C), usa mean = Xf.mean(axis=(0,1), keepdims=True)
 
@@ -356,13 +316,13 @@ model.fit(train_gen,
         epochs=30
 )
 model.save('backbone_test.hdf5')
+
 """
 model = get_model_paper()
 
 model.fit(train_gen,
         validation_data=val_gen, 
-        epochs=50, 
+        epochs=20, 
         callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
         verbose=1)
-"""
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)

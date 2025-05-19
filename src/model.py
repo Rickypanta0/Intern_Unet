@@ -4,7 +4,7 @@ Definizione dell'architettura U-Net e compilazione del modello mantenendo lo sti
 """
 import tensorflow as tf
 from keras.metrics import MeanIoU
-from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou
+from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
 
 
 def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
@@ -204,17 +204,29 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     
     seg_head = tf.keras.layers.Conv2D(filters=3, kernel_size=(1, 1), activation='softmax', name='seg_head')(c12)
 
-    model = tf.keras.Model(inputs=inputs, outputs=seg_head)
+    c12_hv = tf.keras.layers.Conv2D(16, (1, 1), kernel_initializer='he_normal', padding='same')(c11)
+    c12_hv = tf.keras.layers.Dropout(0.05)(c12_hv)
+    c12_hv = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(c12_hv)
+    c12_hv = tf.keras.layers.Conv2D(16, (1, 1), kernel_initializer='he_normal', padding='same')(c12_hv)
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    loss = bce_dice_loss
-# o una combo con dice multiclasse
+    hv_head = tf.keras.layers.Conv2D(filters=2, kernel_size=(1, 1), activation='linear', name='hv_head')(c12_hv)
+
+    model = tf.keras.Model(inputs=inputs, outputs={
+    'seg_head': seg_head,
+    'hv_head': hv_head
+    })
 
     model.compile(
-        optimizer=optimizer,
-        loss=loss
-        #metrics=[tf.keras.metrics.MeanIoU(num_classes=3) ]
-    )
+    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+    loss={
+        'seg_head': bce_dice_loss,
+        'hv_head': hover_loss_fixed  # <--- funzione non parametrica
+    },
+    loss_weights={
+        'seg_head': 1.0,
+        'hv_head': 2.0
+    }
+)
     
     return model
 

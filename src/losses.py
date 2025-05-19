@@ -9,7 +9,42 @@ Moduli per le funzioni di perdita custom:
 import tensorflow as tf
 import numpy as np
 
+from tensorflow.keras import backend as K
+from keras.saving import register_keras_serializable
 
+@register_keras_serializable()
+def hover_loss_fixed(y_true, y_pred):
+    return hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0)(y_true, y_pred)
+
+@register_keras_serializable()
+def hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0):
+    """
+    Loss per la testa HV: combina MSE (L2) e gradient loss.
+    """
+    def gradient_x(img):
+        return img[:, :, 1:, :] - img[:, :, :-1, :]
+
+    def gradient_y(img):
+        return img[:, 1:, :, :] - img[:, :-1, :, :]
+
+    def loss(y_true, y_pred):
+        # MSE loss (LH1)
+        mse_loss = K.mean(K.square(y_true - y_pred))
+
+        # Gradient loss (LH2)
+        gx_true = gradient_x(y_true)
+        gx_pred = gradient_x(y_pred)
+        gy_true = gradient_y(y_true)
+        gy_pred = gradient_y(y_pred)
+
+        grad_loss_x = K.mean(K.square(gx_pred - gx_true))
+        grad_loss_y = K.mean(K.square(gy_pred - gy_true))
+        grad_loss = grad_loss_x + grad_loss_y
+
+        return lambda_h1 * mse_loss + lambda_h2 * grad_loss
+
+    return loss
+@register_keras_serializable()
 def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.Tensor:
     """
     Calcola la Dice Loss tra y_true e y_pred.
@@ -27,7 +62,7 @@ def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.T
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return 1.0 - (2.0 * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
-
+@register_keras_serializable()
 def bce_dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     """
     Combina Binary Crossentropy e Dice Loss.
@@ -37,7 +72,7 @@ def bce_dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
     return bce + dice_loss(y_true, y_pred)
 
-
+@register_keras_serializable()
 def weighted_bce_dice(y_true: tf.Tensor, y_pred: tf.Tensor,
                       weight: float = 5.0,
                       smooth: float = 1.0) -> tf.Tensor:
@@ -66,7 +101,7 @@ def weighted_bce_dice(y_true: tf.Tensor, y_pred: tf.Tensor,
     dice = 1.0 - (2.0 * intersection + smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + smooth)
     return tf.reduce_mean(weighted_bce) + dice
 
-
+@register_keras_serializable()
 def get_weighted_bce_dice_loss(weight: float = 5.0) -> callable:
     """
     Restituisce una funzione di perdita parzializzata di weighted_bce_dice con peso fisso.
@@ -99,14 +134,14 @@ def csca_binary_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     dice_coeff = (2.0 * intersection + _smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + _smooth)
     dice_loss_val = 1.0 - dice_coeff
     return _lambda1 * bce + _lambda2 * dice_loss_val
-
+@register_keras_serializable()
 def dice_loss_class(y_true, y_pred, k, smooth=1e-6):
     t = y_true[..., k]
     p = y_pred[..., k]
     inter = tf.reduce_sum(t * p, axis=[1,2])
     denom = tf.reduce_sum(t, axis=[1,2]) + tf.reduce_sum(p, axis=[1,2])
     return 1 - (2*inter + smooth)/(denom + smooth)
-
+@register_keras_serializable()
 def Lp(y_true, y_pred):
     # Cp = CE multiclasse
     cce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
@@ -119,7 +154,7 @@ def Lp(y_true, y_pred):
 # ————————————————————————————————
 # 2) Metriche binarie “nucleo vs background”:
 #    consideriamo “nucleo” i canali BD (0) e CB (2), background = canale BG (1)
-
+@register_keras_serializable()
 def binary_iou(y_true, y_pred):
     # y_true, y_pred: (B,H,W,3) one-hot/softmax
     # facciamo due maschere booleane: nucleo vs non-nucleo
