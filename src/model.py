@@ -281,10 +281,10 @@ def build_unet_with_resnet50(input_shape=(256,256,3)):
         x = Activation('relu')(x)
 
     # 5) Ultimo upsampling per risalire da 128×128 a 256×256
-    x = UpSampling2D(size=(2,2), interpolation='nearest')(x)
+    x_ = UpSampling2D(size=(2,2), interpolation='nearest')(x)
 
     # 6) Testata di segmentazione
-    x = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x)
+    x = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x_)
     x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
     x = Activation('relu')(x)
     x = Dropout(0.1)(x)
@@ -295,8 +295,17 @@ def build_unet_with_resnet50(input_shape=(256,256,3)):
         name='seg_head'
     )(x)
 
+    xh = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x_)
+    xh = BatchNormalization(momentum=0.9, epsilon=1e-3)(xh)
+    xh = Activation('relu')(xh)
+    xh = Dropout(0.1)(xh)
+    hv_head = tf.keras.layers.Conv2D(filters=2, kernel_size=(1, 1), activation='linear', name='hv_head')(xh)
+
     # 7) Compila il modello
-    model = Model(inputs=inputs, outputs=seg_head)
+    model = tf.keras.Model(inputs=inputs, outputs={
+    'seg_head': seg_head,
+    'hv_head': hv_head
+    })
     #model.compile(
     #    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
     #    loss=bce_dice_loss,

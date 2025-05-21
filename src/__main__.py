@@ -80,6 +80,7 @@ class NpyDataGenerator(keras.utils.Sequence):
          seed: tuple[int,int],
          img_np: np.ndarray,
          mask_np: np.ndarray,
+         hv_np : np.ndarray,
          zoom_size: int,
          IMG_SIZE: int
         ) -> tuple[np.ndarray, np.ndarray]:
@@ -124,11 +125,37 @@ class NpyDataGenerator(keras.utils.Sequence):
         )
         yz = tf.image.resize(crop_m, [IMG_SIZE, IMG_SIZE])
 
+        # HV map (H,W,2)
+        if hv_np.ndim != 3 or hv_np.shape[-1] != 2:
+            raise ValueError(f"hv_np deve avere shape (H,W,2), ma ha {hv_np.shape}")
+
+        # Separazione dei canali x e y
+        hv_x = hv_np[..., 0][..., None]  # shape (H,W,1)
+        hv_y = hv_np[..., 1][..., None]
+
+        # Tensor conversione
+        hv_x_t = tf.convert_to_tensor(hv_x, dtype=tf.float32)
+        hv_y_t = tf.convert_to_tensor(hv_y, dtype=tf.float32)
+
+        # Pad + crop + resize per x
+        padded_x = tf.image.resize_with_crop_or_pad(hv_x_t, IMG_SIZE, IMG_SIZE)
+        crop_x = tf.image.stateless_random_crop(padded_x, [zoom_size, zoom_size, 1], seed=seed_tf)
+        hv_cx = tf.image.resize(crop_x, [IMG_SIZE, IMG_SIZE])
+
+        # Pad + crop + resize per y
+        padded_y = tf.image.resize_with_crop_or_pad(hv_y_t, IMG_SIZE, IMG_SIZE)
+        crop_y = tf.image.stateless_random_crop(padded_y, [zoom_size, zoom_size, 1], seed=seed_tf)
+        hv_cy = tf.image.resize(crop_y, [IMG_SIZE, IMG_SIZE])
+
         # 9) Torno a NumPy
+        hv_cx_np = hv_cx.numpy().squeeze(-1).astype(np.float32)
+        hv_cy_np = hv_cy.numpy().squeeze(-1).astype(np.float32)
+        hv_np_f  = np.stack([hv_cx_np, hv_cy_np], axis=-1)
+
         xz_np = xz.numpy().astype(np.float32)
         yz_np = yz.numpy().astype(np.uint8)
 
-        return xz_np, yz_np
+        return xz_np, yz_np, hv_np_f
 
     def _make_target_3ch(self, m2: np.ndarray) -> np.ndarray:
         """Dalla maschera 2D binaria (H,W) ritorna (H,W,3) [body,bg,border]."""
@@ -183,10 +210,10 @@ class NpyDataGenerator(keras.utils.Sequence):
             # 2) zoom augmentations (4 seed diversi)
             #for j in range(1):
             #    seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
-            #    xz, yz = self.augm(seed, img, msk, zoom_size=180, IMG_SIZE=256)
+            #    xz, yz, hv_n = self.augm(seed, img, msk,hv_map, zoom_size=180, IMG_SIZE=256)
             #    Xb[k] = xz
             #    yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
-            #    
+            #    HVb[k] = hv_n
             #    Yb[k] = self._make_target_3ch(yz_)
             #    k += 1
             # 3) flip left–right
@@ -219,11 +246,11 @@ folds = [
      os.path.join(base, 'Fold 1', 'masks', 'fold1', 'distance.npy')),
      (os.path.join(base, 'Fold 3', 'images', 'fold3', 'images.npy'),
      os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy'),
-     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'distance.npy'))]
-#    (os.path.join(base, 'Fold 2', 'images', 'fold2', 'images.npy'),
-#     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'binary_masks.npy'),
-#     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'masks.npy'))
-#]
+     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'distance.npy')),
+    (os.path.join(base, 'Fold 2', 'images', 'fold2', 'images.npy'),
+     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'binary_masks.npy'),
+     os.path.join(base, 'Fold 2', 'masks', 'fold2', 'distance.npy'))
+]
 
 
 num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
@@ -233,8 +260,8 @@ split = int(0.9 * num_all)
 train_IDs = all_IDs[:split]
 val_IDs   = all_IDs[split:]
 # generatori
-train_gen = NpyDataGenerator(folds, train_IDs, batch_size=4, shuffle=True, mmap=True)
-val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=4, shuffle=False, mmap=True)
+train_gen = NpyDataGenerator(folds, train_IDs, batch_size=2, shuffle=True, mmap=True)
+val_gen   = NpyDataGenerator(folds, val_IDs,   batch_size=2, shuffle=False, mmap=True)
 
 #Dynamic Learning rate
 reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
@@ -267,19 +294,19 @@ Xb, Yb = train_gen[0]
 #idx = np.random.randint(Xb.shape[0]-14)
 idx = 0
 print(Xb.shape)
-for i in range(idx,idx + 5):
-    fig, axs = plt.subplots(2, 2, figsize=(6,6))
-    image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
-    mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
-    body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
-
-    axs[0,0].imshow(Xb[i,...,0])                         # immagine normalizzata [0,1]
-    axs[0,1].imshow(body_mask,  vmin=0, vmax=1)  # body
-    axs[1,0].imshow(Yb['hv_head'][i, ..., 0])  # background
-    axs[1,1].imshow(Yb['hv_head'][i, ..., 1])  # border
-
-    plt.tight_layout()
-    plt.show()
+#for i in range(idx,idx + 5):
+#    fig, axs = plt.subplots(2, 2, figsize=(6,6))
+#    image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+#    mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
+#    body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
+#
+#    axs[0,0].imshow(Xb[i,...,0])                         # immagine normalizzata [0,1]
+#    axs[0,1].imshow(body_mask,  vmin=0, vmax=1)  # body
+#    axs[1,0].imshow(Yb['hv_head'][i, ..., 0])  # background
+#    axs[1,1].imshow(Yb['hv_head'][i, ..., 1])  # border
+#
+#    plt.tight_layout()
+#    plt.show()
 """
 mean = Xb.mean(axis=(0,1,2), keepdims=True)
     # se X è singola immagine (H,W,C), usa mean = Xf.mean(axis=(0,1), keepdims=True)
@@ -322,7 +349,7 @@ model = get_model_paper()
 
 model.fit(train_gen,
         validation_data=val_gen, 
-        epochs=20, 
+        epochs=50, 
         callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
         verbose=1)
 #model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)

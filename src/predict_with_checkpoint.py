@@ -59,84 +59,183 @@ model = load_model(
 )
 
 # Predict
+from scipy.ndimage import filters, measurements
+from scipy.ndimage.morphology import (
+    binary_dilation,
+    binary_fill_holes,
+    distance_transform_cdt,
+    distance_transform_edt,
+)
+
+from skimage.segmentation import watershed
+def get_bounding_box(img):
+    """Get bounding box coordinate information."""
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    # due to python indexing, need to add 1 to max
+    # else accessing will be 1px in the box, not out
+    rmax += 1
+    cmax += 1
+    return [rmin, rmax, cmin, cmax]
+from scipy import ndimage
+def remove_small_objects(pred, min_size=64, connectivity=1):
+    """Remove connected components smaller than the specified size.
+
+    This function is taken from skimage.morphology.remove_small_objects, but the warning
+    is removed when a single label is provided. 
+
+    Args:
+        pred: input labelled array
+        min_size: minimum size of instance in output array
+        connectivity: The connectivity defining the neighborhood of a pixel. 
+    
+    Returns:
+        out: output array with instances removed under min_size
+
+    """
+    out = pred
+
+    if min_size == 0:  # shortcut for efficiency
+        return out
+
+    if out.dtype == bool:
+        selem = ndimage.generate_binary_structure(pred.ndim, connectivity)
+        ccs = np.zeros_like(pred, dtype=np.int32)
+        ndimage.label(pred, selem, output=ccs)
+    else:
+        ccs = out
+
+    try:
+        component_sizes = np.bincount(ccs.ravel())
+    except ValueError:
+        raise ValueError(
+            "Negative value labels are not supported. Try "
+            "relabeling the input with `scipy.ndimage.label` or "
+            "`skimage.morphology.label`."
+        )
+
+    too_small = component_sizes < min_size
+    too_small_mask = too_small[ccs]
+    out[too_small_mask] = 0
+
+    return out
+
 preds = model.predict(X_train_rgb)
 seg_preds = preds['seg_head']
 hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+def __proc_np_hv(pred):
+    """Process Nuclei Prediction with XY Coordinate Map.
 
+    Args:
+        pred: prediction output, assuming 
+              channel 0 contain probability map of nuclei
+              channel 1 containing the regressed X-map
+              channel 2 containing the regressed Y-map
+
+    """
+    pred = np.array(pred, dtype=np.float32)
+
+    blb_raw = pred[..., 0]
+    h_dir_raw = pred[..., 1]
+    v_dir_raw = pred[..., 2]
+
+    # processing
+    blb = np.array(blb_raw >= 0.5, dtype=np.int32)
+
+    blb = measurements.label(blb)[0]
+    blb = remove_small_objects(blb, min_size=10)
+    blb[blb > 0] = 1  # background is 0 already
+
+    h_dir = cv2.normalize(
+        h_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+    v_dir = cv2.normalize(
+        v_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+
+    sobelh = cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21)
+    sobelv = cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21)
+    
+    sobelh = 1 - (
+        cv2.normalize(
+            sobelh, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+    sobelv = 1 - (
+        cv2.normalize(
+            sobelv, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+
+    overall = np.maximum(sobelh, sobelv)
+    
+    overall = overall - (1 - blb)
+
+    overall[overall < 0] = 0
+
+    dist = (1.0 - overall) * (blb)
+
+    ## nuclei values form mountains so inverse to get basins
+    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
+    plt.imshow(dist)
+    plt.show()
+    overall = np.array(overall >= 0.55, dtype=np.int32)
+    
+    marker = blb - overall
+    marker[marker < 0] = 0
+    fig, axs = plt.subplots(1,3,figsize=(8,8))
+    axs[0].imshow(marker, cmap='nipy_spectral')
+    axs[0].set_title('markers')
+    axs[1].imshow(blb)
+    axs[1].set_title('Binary')
+    axs[2].imshow(overall)
+    axs[2].set_title('overall')
+    plt.show()
+    marker = binary_fill_holes(marker).astype("uint8")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
+    marker = measurements.label(marker)[0]
+    marker = remove_small_objects(marker, min_size=10)
+    plt.imshow(marker)
+    plt.show()
+    proced_pred = watershed(dist, markers=marker, mask=blb)
+
+    return proced_pred
 # Watershed + HV map visualization and segmentation
 for i in range(X_train.shape[0]):
     img = X_train[i, ..., 0]
-    gt = seg_preds[i]
     seg = seg_preds[i]
     hv = hv_preds[i]
 
-    # Binary mask from seg (body+border vs background)
     body_prob = seg[..., 0]
     border_prob = seg[..., 2]
     bg_prob = seg[..., 1]
     
-    binary_mask = ((body_prob + border_prob) > bg_prob).astype(np.uint8)
-    
-    hv = hv.astype(np.float32)
+    # mappa di probabilità nuclei
+    prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+    pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
 
-    grad_x = cv2.Sobel(hv[..., 0], cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(hv[..., 1], cv2.CV_32F, 0, 1, ksize=3)
+    # segmentazione con watershed guidata da HV map
+    label_map = __proc_np_hv(pred)
 
-    # Sm = max(|∇x(px)|, |∇y(py)|)
-    grad = np.maximum(np.abs(grad_x), np.abs(grad_y))
-    #print("grad range:", grad.min(), grad.max(), grad.mean())
-#
-    #p1, p99 = np.percentile(grad, [1, 99])
-    #grad_stretch = np.clip((grad - p1) / (p99 - p1 + 1e-6), 0, 1)
-#
-    ## Converti in immagine 8 bit
-    #grad_vis = (grad_stretch * 255).astype(np.uint8)
-    #plt.imshow(grad_vis, cmap='hot')
-    #plt.title("Gradient HV Map (Sm)")
-    #plt.colorbar()
-    #plt.axis('off')
-    #plt.show()
-    # === Parametri ottimali trovati nel paper ===
-    h = 0.4  # threshold per q (nuclei prob)
-    k = 0.1  # threshold per Sm (contorni HV)
+    # visualizzazione
+    plt.figure(figsize=(15, 4))
 
-    # 1. Soglia mappa q
-    tau_q_h = (body_prob > h).astype(np.uint8)  # τ(q,h)
-
-    # 2. Soglia mappa Sm
-    tau_Sm_k = (grad > k).astype(np.uint8)    # τ(Sm,k)
-
-    # 3. Marker M = σ(τ(q,h) − τ(Sm,k))
-    M = tau_q_h.astype(np.int32) - tau_Sm_k.astype(np.int32)
-    M[M < 0] = 0  # ReLU
-
-    # 4. Energy landscape E = [1 − τ(Sm,k)] * τ(q,h)
-    E = (1 - tau_Sm_k) * tau_q_h  # pixel con alta q ma fuori dai bordi
-
-    # 5. Distance transform sull’energia
-    from scipy import ndimage as ndi
-    from skimage.segmentation import watershed
-
-    distance = ndi.distance_transform_edt(E)
-
-    # 6. Etichette marker
-    markers, _ = ndi.label(M)
-
-    # 7. Segmentazione finale
-    labels_ws = watershed(-distance, markers, mask=tau_q_h)
-    
-    # 6. Visualizza il risultato
-    plt.figure(figsize=(12, 4))
-    
     plt.subplot(1, 3, 1)
     plt.imshow(img, cmap='gray')
-    plt.title("Maschera nuclei (seg_pred)")
-    
+    plt.title("Input Grayscale")
+
     plt.subplot(1, 3, 2)
-    plt.imshow(gt, cmap='gray')
-    plt.title("Contorni HV (Sm > soglia)")
-    
+    plt.imshow(prob_nucleus, cmap='gray')
+    plt.title("Probabilità Nuclei (body + border)")
+
     plt.subplot(1, 3, 3)
-    plt.imshow(labels_ws, cmap='nipy_spectral')
-    plt.title("Segmentazione finale (Watershed)")
+    plt.imshow(label_map, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
+    plt.title("Segmentazione HV-Watershed")
+    plt.axis('off')
+
+    plt.tight_layout()
     plt.show()
+
