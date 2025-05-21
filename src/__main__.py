@@ -307,43 +307,42 @@ print(Xb.shape)
 #
 #    plt.tight_layout()
 #    plt.show()
-"""
-mean = Xb.mean(axis=(0,1,2), keepdims=True)
-    # se X è singola immagine (H,W,C), usa mean = Xf.mean(axis=(0,1), keepdims=True)
+from segmentation_models import Unet, get_preprocessing
+from segmentation_models.utils import set_trainable
+BACKBONE = 'resnet34'
+preprocess_input = get_preprocessing(BACKBONE)
 
-alpha = 1.4  # >1 aumenta il contrasto
-# 2) formula del contrast stretch
-Xc = mean + alpha * (Xb - mean)
-# 3) ritaglia al range originale
-if Xb.dtype == np.uint8:
-    Xc = np.clip(Xc, 0, 255).astype(np.uint8)
-else:
-    Xc = np.clip(Xc, 0.0, 1.0)
+train_gen = preprocess_input(train_gen)
+val_gen = preprocess_input(val_gen)
 
+model = Unet(backbone_name=BACKBONE, 
+             encoder_weights='imagenet',
+             input_shape = (None, None, 3),
+             decoder_block_type='upsampling',
+             decoder_use_batchnorm = True, 
+             encoder_freeze=True)
 
-os.environ["SM_FRAMEWORK"] = "tf.keras"
-#BACKBONE = 'resnet34'
-#preprocess_input = sm.get_preprocessing(BACKBONE)
+model.compile('Adam', 
+              'binary_crossentropy',
+              ['binary_accuracy'])
 
-
-# define model
-model = sm.Unet(BACKBONE, encoder_weights='imagenet')
-model.compile(
-    'Adam',
-    loss=sm.losses.bce_jaccard_loss,
-    metrics=[sm.metrics.iou_score],
-)
-
-# fit model
-# if you use data generator use model.fit_generator(...) instead of model.fit(...)
-# more about `fit_generator` here: https://keras.io/models/sequential/#fit_generator
+# pretrain model decoder
 model.fit(train_gen,
-        validation_data=val_gen,
-        batch_size=4,
-        epochs=30
-)
-model.save('backbone_test.hdf5')
+          validation_data=val_gen,
+          epochs=2,
+          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+          verbose=1)
 
+
+# release all layers for training
+set_trainable(model) # set all layers trainable and recompile model
+
+# continue training
+model.fit(train_gen,
+          validation_data=val_gen,
+          epochs=100,
+          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+          verbose=1)
 """
 model = get_model_paper()
 
@@ -352,4 +351,4 @@ model.fit(train_gen,
         epochs=50, 
         callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
         verbose=1)
-#model, history= train(X_train, Y_train, X_test, Y_test,epochs=50,batch_size=8)
+"""

@@ -44,7 +44,9 @@ mean = X_gray.mean(axis=(0, 1, 2), keepdims=True)
 Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
 
 # Split
-X_train, _, Y_train, _ = train_test_split(Xc, Y, test_size=0.1, random_state=SEED)
+X_train, _, Y_train, _, HV_train, _ = train_test_split(
+    Xc, Y, HV, test_size=0.1, random_state=SEED
+)
 X_train_rgb = np.repeat(X_train, 3, axis=-1)
 from src.losses import bce_dice_loss
 # Load model
@@ -170,7 +172,28 @@ def __proc_np_hv(pred):
     )
 
     overall = np.maximum(sobelh, sobelv)
+
+    overall[blb>0] = 3
+
+    boundary_mask = overall > 0.5  # es. 0.4
+    kernel = np.ones((3,3),np.uint8)
+    boundary_mask = boundary_mask.astype(np.uint8)
+    boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2)
     
+    from skimage.measure import label
+    markers = label(1-boundary_mask_)
+    from skimage.segmentation import watershed
+    blb_ = 1-blb
+    instance_map = watershed(overall, markers, mask=blb_)
+    #fig, axs = plt.subplots(1,3,figsize=(8,8))
+    #axs[0].imshow(overall)
+    #axs[1].imshow(markers)
+    #axs[1].set_title('Markers')
+    #b_ = -boundary_mask
+    #axs[2].imshow(boundary_mask_)
+    #axs[2].set_title('BM no rumore')
+    #plt.show()
+    """
     overall = overall - (1 - blb)
 
     overall[overall < 0] = 0
@@ -201,13 +224,15 @@ def __proc_np_hv(pred):
     plt.imshow(marker)
     plt.show()
     proced_pred = watershed(dist, markers=marker, mask=blb)
-
-    return proced_pred
+    """
+    
+    return instance_map
 # Watershed + HV map visualization and segmentation
 for i in range(X_train.shape[0]):
     img = X_train[i, ..., 0]
     seg = seg_preds[i]
     hv = hv_preds[i]
+    hv_t = HV_train[i]
 
     body_prob = seg[..., 0]
     border_prob = seg[..., 2]
@@ -221,21 +246,15 @@ for i in range(X_train.shape[0]):
     label_map = __proc_np_hv(pred)
 
     # visualizzazione
-    plt.figure(figsize=(15, 4))
-
-    plt.subplot(1, 3, 1)
-    plt.imshow(img, cmap='gray')
-    plt.title("Input Grayscale")
-
-    plt.subplot(1, 3, 2)
-    plt.imshow(prob_nucleus, cmap='gray')
-    plt.title("Probabilità Nuclei (body + border)")
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(label_map, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
-    plt.title("Segmentazione HV-Watershed")
-    plt.axis('off')
-
+    fig, axs = plt.subplots(2,2,figsize=(10,10))
+    axs[0,0].imshow(img,cmap='gray')
+    axs[0,0].set_title('Input Grayscale')
+    axs[0,1].imshow(prob_nucleus,cmap='gray')
+    axs[0,1].set_title('Binary pred')
+    axs[1,0].imshow(label_map, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
+    axs[1,0].set_title("Segmentazione HV-Watershed")
+    axs[1,1].imshow(hv_t[...,0])
+    axs[1,1].set_title("Segmentazione HV-Watershed")
     plt.tight_layout()
     plt.show()
 
