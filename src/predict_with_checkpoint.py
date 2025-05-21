@@ -50,7 +50,7 @@ X_train, _, Y_train, _, HV_train, _ = train_test_split(
 X_train_rgb = np.repeat(X_train, 3, axis=-1)
 from src.losses import bce_dice_loss
 # Load model
-checkpoint_path = 'models/checkpoints/model_grayscale_HV.keras'
+checkpoint_path = 'models/checkpoints/model_grayscale_HV_v2.keras'
 
 model = load_model(
     checkpoint_path,
