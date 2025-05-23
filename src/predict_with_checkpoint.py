@@ -50,7 +50,7 @@ X_train, _, Y_train, _, HV_train, _ = train_test_split(
 X_train_rgb = np.repeat(X_train, 3, axis=-1)
 from src.losses import bce_dice_loss
 # Load model
-checkpoint_path = 'models/checkpoints/model_grayscale_HV_v2.keras'
+checkpoint_path = 'models/checkpoints/model_grayscale_HV.keras'
 
 model = load_model(
     checkpoint_path,
@@ -127,6 +127,7 @@ def remove_small_objects(pred, min_size=64, connectivity=1):
 preds = model.predict(X_train_rgb)
 seg_preds = preds['seg_head']
 hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+
 def __proc_np_hv(pred):
     """Process Nuclei Prediction with XY Coordinate Map.
 
@@ -185,48 +186,50 @@ def __proc_np_hv(pred):
     from skimage.segmentation import watershed
     blb_ = 1-blb
     instance_map = watershed(overall, markers, mask=blb_)
-    #fig, axs = plt.subplots(1,3,figsize=(8,8))
-    #axs[0].imshow(overall)
-    #axs[1].imshow(markers)
-    #axs[1].set_title('Markers')
-    #b_ = -boundary_mask
-    #axs[2].imshow(boundary_mask_)
-    #axs[2].set_title('BM no rumore')
-    #plt.show()
-    """
-    overall = overall - (1 - blb)
-
-    overall[overall < 0] = 0
-
-    dist = (1.0 - overall) * (blb)
-
-    ## nuclei values form mountains so inverse to get basins
-    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
-    plt.imshow(dist)
-    plt.show()
-    overall = np.array(overall >= 0.55, dtype=np.int32)
-    
-    marker = blb - overall
-    marker[marker < 0] = 0
-    fig, axs = plt.subplots(1,3,figsize=(8,8))
-    axs[0].imshow(marker, cmap='nipy_spectral')
-    axs[0].set_title('markers')
-    axs[1].imshow(blb)
-    axs[1].set_title('Binary')
-    axs[2].imshow(overall)
-    axs[2].set_title('overall')
-    plt.show()
-    marker = binary_fill_holes(marker).astype("uint8")
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
-    marker = measurements.label(marker)[0]
-    marker = remove_small_objects(marker, min_size=10)
-    plt.imshow(marker)
-    plt.show()
-    proced_pred = watershed(dist, markers=marker, mask=blb)
-    """
-    
     return instance_map
+
+def count_blob(labels, blb):
+    # Se blb ha valori float o non è in formato uint8, lo normalizzo per la visualizzazione
+    if blb.dtype != np.uint8:
+        blb_norm = cv2.normalize(blb, None, 0, 255, cv2.NORM_MINMAX)
+        blb_uint8 = blb_norm.astype(np.uint8)
+    else:
+        blb_uint8 = blb
+
+    # Converti in BGR per disegnare i contorni
+    contour_img = cv2.cvtColor(blb_uint8, cv2.COLOR_GRAY2BGR)
+
+    isolated_count = 0
+    cluster_count = 0
+
+    for label in np.unique(labels):
+        if label <= 0:
+            continue
+
+        single_mask = (labels == label).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(single_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not cnts or len(cnts[0]) < 12:
+            continue
+
+        cntr = cnts[0]
+        area = cv2.contourArea(cntr)
+        convex_hull = cv2.convexHull(cntr)
+        convex_hull_area = cv2.contourArea(convex_hull)
+
+        if convex_hull_area == 0:
+            continue  # Evita divisione per zero
+
+        ratio = area / convex_hull_area
+        #if ratio < 0.91:
+        #    cv2.drawContours(contour_img, [cntr], 0, (0, 0, 255), 2)
+        #    cluster_count += 1
+        #else:
+        cv2.drawContours(contour_img, [cntr], 0, (0, 255, 0), 2)
+        isolated_count += 1
+
+    return (contour_img, isolated_count, cluster_count)
+
 # Watershed + HV map visualization and segmentation
 for i in range(X_train.shape[0]):
     img = X_train[i, ..., 0]
@@ -244,17 +247,28 @@ for i in range(X_train.shape[0]):
 
     # segmentazione con watershed guidata da HV map
     label_map = __proc_np_hv(pred)
-
+    plt.imshow(prob_nucleus)
+    plt.show()
+    pred_GT = np.stack([Y_train[i], hv_t[..., 0], hv_t[..., 1]], axis=-1)
+    label_map_GT = __proc_np_hv(pred_GT)
+    contour_img_blb, isolated_count_blb, cluster_blb = count_blob(label_map, prob_nucleus)
+    contour_img_hv, isolated_count_hv, cluster_hv = count_blob(label_map_GT, Y_train[i])
+    print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
     # visualizzazione
-    fig, axs = plt.subplots(2,2,figsize=(10,10))
+    fig, axs = plt.subplots(2,3,figsize=(8,8))
+    fig.suptitle(f"Binart nuceli count: {isolated_count_blb}, GT nuclei count: {isolated_count_hv}", fontsize=14)
     axs[0,0].imshow(img,cmap='gray')
     axs[0,0].set_title('Input Grayscale')
     axs[0,1].imshow(prob_nucleus,cmap='gray')
     axs[0,1].set_title('Binary pred')
+    axs[0,2].imshow(contour_img_hv)
+    axs[0,2].set_title('Count GT')
     axs[1,0].imshow(label_map, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
     axs[1,0].set_title("Segmentazione HV-Watershed")
     axs[1,1].imshow(hv_t[...,0])
-    axs[1,1].set_title("Segmentazione HV-Watershed")
+    axs[1,1].set_title("Distance map X")
+    axs[1,2].imshow(contour_img_blb)
+    axs[1,2].set_title("Count Binary Pred")
     plt.tight_layout()
     plt.show()
 
