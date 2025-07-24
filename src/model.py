@@ -4,7 +4,7 @@ Definizione dell'architettura U-Net e compilazione del modello mantenendo lo sti
 """
 import tensorflow as tf
 from keras.metrics import MeanIoU
-from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
+#from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
 
 
 def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
@@ -215,17 +215,67 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     'seg_head': seg_head,
     'hv_head': hv_head
     })
+    from src.losses import bce_dice_loss,hover_loss_fixed
+    from tensorflow.keras.utils import register_keras_serializable
+    
+    @register_keras_serializable()
+    class CellDice(tf.keras.metrics.Metric):
+        """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
+
+        def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+            super().__init__(name=name, **kw)
+            self.smooth = smooth
+            self.intersection = self.add_weight(name="inter", initializer="zeros")
+            self.union        = self.add_weight(name="union", initializer="zeros")
+
+        def _bin_mask(self, y):
+            body, bg, border = tf.unstack(y, axis=-1)
+            return tf.cast(body + border > bg, tf.float32)
+
+        def update_state(self, y_true, y_pred, sample_weight=None):
+            y_true_b = self._bin_mask(y_true)           # bool
+            y_pred_b = self._bin_mask(y_pred)
+
+            inter = tf.reduce_sum(y_true_b * y_pred_b)
+            union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
+            self.intersection.assign_add(inter)
+            self.union.assign_add(union)
+
+        def result(self):
+            return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
+
+        def reset_state(self):
+            self.intersection.assign(0.0)
+            self.union.assign(0.0)
+
+    #import tensorflow_addons as tfa
+    #dice_metric = tfa.metrics.F1Score(
+    #    num_classes=1,                  # binario
+    #    average='micro',                # restituisce scalare, non rank‑0
+    #    threshold=0.5
+    #)
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=1e-3,
+        first_decay_steps=25,   # 10 epoche
+        t_mul=2.0,                                # lunghezza fase raddoppia
+        m_mul=0.8,                                # ampiezza si riduce
+        alpha=1e-5 / 1e-3                         # min_lr
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
     model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+    optimizer=optimizer,
     loss={
         'seg_head': bce_dice_loss,
         'hv_head': hover_loss_fixed  # <--- funzione non parametrica
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 2.0
-    }
+        'hv_head': 0.5
+    },
+    metrics={'seg_head': [CellDice()],
+             'hv_head' : []}
 )
     
     return model

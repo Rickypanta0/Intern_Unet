@@ -1,10 +1,11 @@
-from .train import train
+print(f"Eseguito: {__file__}")
+
 from .data_loader import load_folds
 import os
 import tensorflow as tf
 import numpy as np
 from sklearn.model_selection import train_test_split
-from .predict import predict_masks
+
 from .utils.visualization import show_threshold_pairs_test
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
@@ -133,28 +134,25 @@ def show_batch(Xb, Yb, labels, n=7):
     plt.tight_layout()
     plt.show()
 
-base = os.path.join('data','raw')
-folds = [os.path.join(base, 'Fold 3', 'images', 'fold3', 'images.npy'), 
-         os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy'),
-         os.path.join(base, 'Fold 3', 'masks', 'fold3', 'masks.npy')]
-
-X = np.load(folds[0])
-Y = np.load(folds[1])
-Z= np.load(folds[2])
 from scipy.ndimage import label
 def build_instance_map_valuewise(mask_6ch):
     instance_map = np.zeros(mask_6ch.shape[:2], dtype=np.uint16)
     current_id = 1
-
-    for ch in range(6):
+    
+    for ch in range(5):
         unique_vals = np.unique(mask_6ch[..., ch])
+        
         unique_vals = unique_vals[unique_vals > 0]
         for val in unique_vals:
             mask = (mask_6ch[..., ch] == val)
             if np.any(mask):
                 instance_map[mask] = current_id
                 current_id += 1
-
+        #fig, axs = plt.subplots(1,2,figsize=(8,8))
+        #fig.suptitle(f"{unique_vals}")
+        #axs[0].imshow(mask_6ch[..., ch])
+        #axs[1].imshow(instance_map)
+        #plt.show()
     return instance_map
 
 
@@ -247,15 +245,16 @@ class GenInstanceHV(GenInstance):
         y_map = np.zeros(orig_ann.shape[:2], dtype=np.float32)
 
         inst_list = list(np.unique(crop_ann))
+        #print("list:", inst_list)
         if 0 in inst_list:
             inst_list.remove(0)
-        if len(inst_list)>0:
-            inst_list.pop()
+        #if len(inst_list)>0:
+        #    inst_list.pop()
         #print("list:",inst_list)
         for inst_id in inst_list:
             inst_map = np.array(fixed_ann == inst_id, np.uint8)
             inst_box = bounding_box(inst_map)
-        
+
             #print("P",inst_map.shape, inst_box)
             # expand the box by 2px
             # Because we first pad the ann at line 207, the bboxes
@@ -271,6 +270,7 @@ class GenInstanceHV(GenInstance):
 
             if inst_map.shape[0] < 2 or \
                 inst_map.shape[1] < 2:
+                #print("SKIIP")
                 continue
             #print("D",inst_map.shape, inst_box)
             inst_com = list(measurements.center_of_mass(inst_map))
@@ -337,7 +337,9 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
 
     # Prealloca array per salvare le HV maps
     distance_maps = np.zeros((N, H, W, 2), dtype=np.float32)
-
+    blbs = np.zeros((N, H, W, 1), dtype=np.float32)
+    #count per il check random
+    count = 0
     for i in tqdm(range(N), desc="Generating HV maps"):
         mask = masks[i]  # shape (H, W, 6)
         instance_map = build_instance_map_valuewise(mask)
@@ -346,49 +348,110 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
         instance_input = instance_map[..., np.newaxis]
         gen = GenInstanceHV(crop_shape=(H, W))
         out = gen._augment(instance_input, None)
-        #plt.imshow(out[...,1])
-        #plt.show()
+
         distance_maps[i] = out[..., 1:3]  # only HV channels
+        #fig,axs = plt.subplots(1,3,figsize=(8,8))
+        #axs[0].imshow(instance_input)
+        #axs[1].imshow(out[...,1])
+        #axs[2].imshow(masks[i,...,0])
+        #plt.show()
+
+        #create binary masks with only neoplastic cells
+        blb = mask[...,5]
+        #blb = np.where(instance_map!=0, 1.0, 0.0).astype(np.float32)[..., np.newaxis]
+        blbs[i] = blb[...,np.newaxis]
+        
+        if np.random.rand() < 0.25 and count<30:
+            count+=1
+            fig, axs = plt.subplots(1,3,figsize=(8,8))
+            axs[0].imshow(blb, cmap='gray')
+            axs[1].imshow(out[...,1])
+            axs[2].imshow(instance_input)
+            plt.show()
 
     # Salva
+    binary_path = os.path.join(os.path.dirname(masks_path), "binary_masks.npy")
+    np.save(binary_path, blbs)
+    print(f"Salvato: {binary_path}")
     out_path = os.path.join(os.path.dirname(masks_path), out_name)
     np.save(out_path, distance_maps)
     print(f"Salvato: {out_path}")
 
 # Esempio d'uso
-folds = [os.path.join('data', 'raw', 'Fold 3', 'masks', 'fold3', 'masks.npy'),
-         os.path.join('data', 'raw', 'Fold 2', 'masks', 'fold2', 'masks.npy'),
-         os.path.join('data', 'raw', 'Fold 1', 'masks', 'fold1', 'masks.npy'),
-         os.path.join('data', 'raw','val', 'Fold 3', 'masks', 'fold3', 'masks.npy')]
-#for i in folds:
-#    generate_distance_maps(i)
-#distance_maps = np.zeros((Z.shape[0], 256,256, 2), dtype=np.float32)
-#for i in range(Z.shape[0]):
-#    instance_map = build_instance_map_valuewise(Z[i])
-#    print("instance",np.unique(instance_map))
-#    instance_input = instance_map[..., np.newaxis]
-#    print(instance_input.shape)
-#    gen = GenInstanceHV(crop_shape=(256,256))
-#    out = gen._augment(instance_input, None)
-#    
-#    distance_maps[i] = out[..., 1:3]  # [x_map, y_map]
-#    
-#    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-#    
-#    axs[0].imshow(instance_map, cmap='nipy_spectral')
-#    axs[0].set_title("Instance Map")
-#    
-#    axs[1].imshow(distance_maps[i, ..., 0], cmap='coolwarm')
-#    axs[1].set_title("Horizontal (HV_x)")
-#    
-#    axs[2].imshow(distance_maps[i, ..., 1], cmap='coolwarm')
-#    axs[2].set_title("Vertical (HV_y)")
-#    
-#    plt.tight_layout()
-#    #axs[0,0].imshow(instance_map)
-#    #axs[0,1].imshow(Z[i,...,0])
-#    #axs[0,2].imshow(Z[i,...,1])
-#    #axs[1,0].imshow(Z[i,...,2])
-#    #axs[1,1].imshow(Z[i,...,3])
-#    #axs[1,2].imshow(Z[i,...,4])
-#    plt.show()
+folds = [os.path.join('data', 'raw', 'Fold 2', 'masks', 'masks.npy'),
+         os.path.join('data', 'raw', 'Fold 3', 'masks', 'masks.npy'),
+        os.path.join('data', 'raw', 'Fold 1', 'masks', 'masks.npy')] 
+
+
+
+for i in folds:
+    generate_distance_maps(i)
+"""
+base = os.path.join('data','raw_neoplastic')
+fold = [os.path.join(base, 'Fold 3', 'images', 'images.npy'), 
+         os.path.join(base, 'Fold 3', 'masks', 'distance.npy'),
+         os.path.join(base, 'Fold 3', 'masks', 'masks_neo.npy')]
+
+X = np.load(fold[0])
+Y = np.load(fold[1])
+Z= np.load(fold[2])
+for i in range(Z.shape[0]):
+    fig, axs = plt.subplots(1, 4, figsize=(10, 4))
+
+    # ---- RGB (o BGR) normalizzato ----
+    rgb = X[i].astype(np.float32)           # se è uint8 puoi saltare il /255
+    if rgb.max() > 1.0:
+        rgb = rgb / 255.0                   # ora è in [0,1]
+    axs[0].imshow(rgb)
+    axs[0].set_title("Input")
+
+    # ---- HV distance maps ----
+    axs[1].imshow(Y[i][..., 0], cmap="jet") # componente H
+    axs[1].set_title("dx")
+
+    axs[2].imshow(Y[i][..., 1], cmap="jet") # componente V
+    axs[2].set_title("dy")
+
+    # ---- maschera binaria ----
+    axs[3].imshow(Z[i][..., 0], cmap="gray")
+    axs[3].set_title("Mask neo")
+
+    for ax in axs:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+"""
+"""
+distance_maps = np.zeros((Z.shape[0], 256,256, 2), dtype=np.float32)
+for i in range(Z.shape[0]):
+    instance_map = build_instance_map_valuewise(Z[i])
+    print("instance",np.unique(instance_map))
+    instance_input = instance_map[..., np.newaxis]
+    print(instance_input.shape)
+    gen = GenInstanceHV(crop_shape=(256,256))
+    out = gen._augment(instance_input, None)
+    
+    distance_maps[i] = out[..., 1:3]  # [x_map, y_map]
+    
+    fig, axs = plt.subplots(2, 3, figsize=(12, 4))
+    
+    #axs[0].imshow(instance_map, cmap='nipy_spectral')
+    #axs[0].set_title("Instance Map")
+    #
+    #axs[1].imshow(distance_maps[i, ..., 0], cmap='coolwarm')
+    #axs[1].set_title("Horizontal (HV_x)")
+    #
+    #axs[2].imshow(distance_maps[i, ..., 1], cmap='coolwarm')
+    #axs[2].set_title("Vertical (HV_y)")
+
+    test = np.where(instance_map != 0, 1.0, 0.0).astype(np.float32)[..., np.newaxis]
+    plt.tight_layout()
+    axs[0,0].imshow(instance_map)
+    axs[0,1].imshow(Z[i,...,0])
+    axs[0,2].imshow(Z[i,...,1])
+    axs[1,0].imshow(Z[i,...,2])
+    axs[1,1].imshow(Z[i,...,3])
+    axs[1,2].imshow(test)
+    plt.show()
+"""

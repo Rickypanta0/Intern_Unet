@@ -7,6 +7,10 @@ Moduli per le funzioni di perdita custom:
 - CSCA Binary Loss (composita)
 """
 import tensorflow as tf
+from tensorflow.keras.losses import BinaryCrossentropy, MeanSquaredError
+from tensorflow.keras import backend as K
+from tensorflow.keras.saving import register_keras_serializable
+import tensorflow as tf
 import numpy as np
 
 from tensorflow.keras import backend as K
@@ -18,9 +22,9 @@ def hover_loss_fixed(y_true, y_pred):
 
 @register_keras_serializable()
 def hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0):
-    """
-    Loss per la testa HV: combina MSE (L2) e gradient loss.
-    """
+    
+    #Loss per la testa HV: combina MSE (L2) e gradient loss.
+    
     def gradient_x(img):
         return img[:, :, 1:, :] - img[:, :, :-1, :]
 
@@ -44,33 +48,46 @@ def hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0):
         return lambda_h1 * mse_loss + lambda_h2 * grad_loss
 
     return loss
+
+dice_loss_fn = tf.keras.losses.Dice(
+    reduction=tf.keras.losses.Reduction.NONE,  # <‑‑ niente media interna
+    name="dice"
+)
+
+@register_keras_serializable()
+def bce_dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    
+    #Combina Binary Crossentropy e Dice Loss.
+
+    #L = BCE(y_true, y_pred) + DiceLoss(y_true, y_pred)
+    bce = tf.reduce_mean(
+        tf.keras.losses.binary_crossentropy(y_true, y_pred),
+        axis=[1, 2]                          # riduci H, W, C
+    ) 
+    dice_per_img = dice_loss_fn(y_true, y_pred)
+    #bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    return bce + dice_per_img
+
+
 @register_keras_serializable()
 def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.Tensor:
-    """
-    Calcola la Dice Loss tra y_true e y_pred.
+    
+    #Calcola la Dice Loss tra y_true e y_pred.
 
-    Args:
-        y_true: tensor di forma [B, H, W, 1], valori binari o continui in [0,1]
-        y_pred: tensor di forma [B, H, W, 1], predizioni continui in [0,1]
-        smooth: fattore di smoothing per evitare divisione per zero
-
-    Returns:
-        Dice Loss (1 - dice coefficient)
-    """
+    #Args:
+    #    y_true: tensor di forma [B, H, W, 1], valori binari o continui in [0,1]
+    #    y_pred: tensor di forma [B, H, W, 1], predizioni continui in [0,1]
+    #    smooth: fattore di smoothing per evitare divisione per zero
+#
+    #Returns:
+    #    Dice Loss (1 - dice coefficient)
+    
     y_true_f = tf.reshape(tf.cast(y_true, tf.float32), [-1])
     y_pred_f = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return 1.0 - (2.0 * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
-@register_keras_serializable()
-def bce_dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """
-    Combina Binary Crossentropy e Dice Loss.
 
-    L = BCE(y_true, y_pred) + DiceLoss(y_true, y_pred)
-    """
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    return bce + dice_loss(y_true, y_pred)
 
 @register_keras_serializable()
 def weighted_bce_dice(y_true: tf.Tensor, y_pred: tf.Tensor,

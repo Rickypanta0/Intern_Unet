@@ -7,17 +7,17 @@ from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import load_model
-from src.losses import  hover_loss_fixed
+import tensorflow as tf
 
 # Load data
-base = os.path.join('data', 'raw', 'val')
+base = os.path.join('data', 'raw')
 folds = [
-    (os.path.join(base, 'Fold 3', 'images', 'fold3', 'images.npy'),
-     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'binary_masks.npy'),
-     os.path.join(base, 'Fold 3', 'masks', 'fold3', 'distance.npy'))
+    (os.path.join(base,'Fold 3', 'images', 'images.npy'),
+     os.path.join(base,'Fold 3', 'masks', 'binary_masks.npy'),
+     os.path.join(base, 'Fold 3','masks', 'distance.npy'))
 ]
 
-N = 13
+N = 14
 imgs_list, masks_list, dmaps_list = [], [], []
 SEED = 42
 
@@ -38,8 +38,8 @@ HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
 X = X + 15
-X = X / 255
-X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
+X_gray = X / 255
+#X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
 mean = X_gray.mean(axis=(0, 1, 2), keepdims=True)
 Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
 
@@ -47,17 +47,29 @@ Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
 X_train, _, Y_train, _, HV_train, _ = train_test_split(
     Xc, Y, HV, test_size=0.1, random_state=SEED
 )
-X_train_rgb = np.repeat(X_train, 3, axis=-1)
-from src.losses import bce_dice_loss
+#X_train_rgb = np.repeat(X_train, 3, axis=-1)
+X_train_rgb = X_train
 # Load model
-checkpoint_path = 'models/checkpoints/model_grayscale_HV.keras'
+from src.losses import bce_dice_loss,hover_loss_fixed
+checkpoint_path='models/checkpoints/model_RGB_HV_v3.keras'
 
 model = load_model(
     checkpoint_path,
     custom_objects={
-        'bce_dice_loss': bce_dice_loss,
-        'hover_loss_fixed': hover_loss_fixed
-    }
+        "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
+        "HVLoss": hover_loss_fixed
+    },
+    compile=False                    # ← evita la ricompilazione automatica
+)
+
+# --------------------------------------------
+# 3) ricompila con le tue loss/optimizer
+# --------------------------------------------
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3),
+    loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
+    loss_weights={"seg_head": 2.0, "hv_head": 1.0},
 )
 
 # Predict
@@ -128,7 +140,7 @@ preds = model.predict(X_train_rgb)
 seg_preds = preds['seg_head']
 hv_preds  = preds['hv_head']  # (batch, H, W, 2)
 
-def __proc_np_hv(pred):
+def __proc_np_hv(pred, GT=False):
     """Process Nuclei Prediction with XY Coordinate Map.
 
     Args:
@@ -173,32 +185,44 @@ def __proc_np_hv(pred):
     )
 
     overall = np.maximum(sobelh, sobelv)
-
+    
     overall[blb>0] = 3
-
-    boundary_mask = overall > 0.5  # es. 0.4
+    #plt.imshow(overall)
+    #plt.show()
+    treshold = 0.4 if GT else 0.5
+    boundary_mask = overall > treshold  # es. 0.4
     kernel = np.ones((3,3),np.uint8)
     boundary_mask = boundary_mask.astype(np.uint8)
     boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2)
     
     from skimage.measure import label
     markers = label(1-boundary_mask_)
+    #print("label markers: ", list(np.unique(markers)))
     from skimage.segmentation import watershed
     blb_ = 1-blb
+    #plt.imshow(markers)
+    #plt.show()
     instance_map = watershed(overall, markers, mask=blb_)
+
     return instance_map
 
-def count_blob(labels, blb):
+def count_blob(labels, blb, GT=False):
     # Se blb ha valori float o non è in formato uint8, lo normalizzo per la visualizzazione
     if blb.dtype != np.uint8:
         blb_norm = cv2.normalize(blb, None, 0, 255, cv2.NORM_MINMAX)
         blb_uint8 = blb_norm.astype(np.uint8)
     else:
         blb_uint8 = blb
-
+    if 255 not in np.unique(blb_uint8):
+        blb_uint8 = blb_uint8 * 255
+    
     # Converti in BGR per disegnare i contorni
     contour_img = cv2.cvtColor(blb_uint8, cv2.COLOR_GRAY2BGR)
-
+    #fig, axs = plt.subplots(1,2,figsize=(8,8))
+    #axs[0].imshow(contour_img)
+    #axs[1].imshow(labels)
+    #plt.show()
+    #print(np.unique(labels))
     isolated_count = 0
     cluster_count = 0
 
@@ -207,9 +231,11 @@ def count_blob(labels, blb):
             continue
 
         single_mask = (labels == label).astype(np.uint8) * 255
-        cnts, _ = cv2.findContours(single_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        if not cnts or len(cnts[0]) < 12:
+        cnts, _ = cv2.findContours(single_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        treshold = 3 if GT else 12
+        if not cnts or len(cnts[0]) < treshold:
+            print("SKIPP")
             continue
 
         cntr = cnts[0]
@@ -232,7 +258,7 @@ def count_blob(labels, blb):
 
 # Watershed + HV map visualization and segmentation
 for i in range(X_train.shape[0]):
-    img = X_train[i, ..., 0]
+    img = X_train[i]
     seg = seg_preds[i]
     hv = hv_preds[i]
     hv_t = HV_train[i]
@@ -247,17 +273,18 @@ for i in range(X_train.shape[0]):
 
     # segmentazione con watershed guidata da HV map
     label_map = __proc_np_hv(pred)
-    plt.imshow(prob_nucleus)
-    plt.show()
-    pred_GT = np.stack([Y_train[i], hv_t[..., 0], hv_t[..., 1]], axis=-1)
-    label_map_GT = __proc_np_hv(pred_GT)
+    #plt.imshow(hv_t[...,1])
+    #plt.show()
+    print(Y_train[i].shape, hv_t[..., 0].shape)
+    pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+    label_map_GT = __proc_np_hv(pred_GT, GT=True)
     contour_img_blb, isolated_count_blb, cluster_blb = count_blob(label_map, prob_nucleus)
-    contour_img_hv, isolated_count_hv, cluster_hv = count_blob(label_map_GT, Y_train[i])
+    contour_img_hv, isolated_count_hv, cluster_hv = count_blob(label_map_GT, Y_train[i], GT=True)
     print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
     # visualizzazione
     fig, axs = plt.subplots(2,3,figsize=(8,8))
     fig.suptitle(f"Binart nuceli count: {isolated_count_blb}, GT nuclei count: {isolated_count_hv}", fontsize=14)
-    axs[0,0].imshow(img,cmap='gray')
+    axs[0,0].imshow(img)
     axs[0,0].set_title('Input Grayscale')
     axs[0,1].imshow(prob_nucleus,cmap='gray')
     axs[0,1].set_title('Binary pred')
