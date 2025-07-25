@@ -9,69 +9,6 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import load_model
 import tensorflow as tf
 
-# Load data
-base = os.path.join('data', 'raw')
-folds = [
-    (os.path.join(base,'Fold 3', 'images', 'images.npy'),
-     os.path.join(base,'Fold 3', 'masks', 'binary_masks.npy'),
-     os.path.join(base, 'Fold 3','masks', 'distance.npy'))
-]
-
-N = 14
-imgs_list, masks_list, dmaps_list = [], [], []
-SEED = 42
-
-for i, (img_path, mask_path, dist_path) in enumerate(folds):
-    rng = np.random.default_rng(SEED + i)
-    imgs = np.load(img_path, mmap_mode='r')
-    masks = np.load(mask_path, mmap_mode='r')
-    dmaps = np.load(dist_path, mmap_mode='r')
-    
-    idxs = rng.choice(len(imgs), size=N, replace=False)
-    imgs_list.append(imgs[idxs])
-    masks_list.append(masks[idxs])
-    dmaps_list.append(dmaps[idxs])
-
-X = np.concatenate(imgs_list, axis=0)
-Y = np.concatenate(masks_list, axis=0)
-HV = np.concatenate(dmaps_list, axis=0)
-
-# Preprocess input images
-X = X + 15
-X_gray = X / 255
-#X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
-mean = X_gray.mean(axis=(0, 1, 2), keepdims=True)
-Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
-
-# Split
-X_train, _, Y_train, _, HV_train, _ = train_test_split(
-    Xc, Y, HV, test_size=0.1, random_state=SEED
-)
-#X_train_rgb = np.repeat(X_train, 3, axis=-1)
-X_train_rgb = X_train
-# Load model
-from src.losses import bce_dice_loss,hover_loss_fixed
-checkpoint_path='models/checkpoints/model_RGB_HV_v3.keras'
-
-model = load_model(
-    checkpoint_path,
-    custom_objects={
-        "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
-        "HVLoss": hover_loss_fixed
-    },
-    compile=False                    # ← evita la ricompilazione automatica
-)
-
-# --------------------------------------------
-# 3) ricompila con le tue loss/optimizer
-# --------------------------------------------
-
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(1e-3),
-    loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
-    loss_weights={"seg_head": 2.0, "hv_head": 1.0},
-)
-
 # Predict
 from scipy.ndimage import filters, measurements
 from scipy.ndimage.morphology import (
@@ -136,11 +73,7 @@ def remove_small_objects(pred, min_size=64, connectivity=1):
 
     return out
 
-preds = model.predict(X_train_rgb)
-seg_preds = preds['seg_head']
-hv_preds  = preds['hv_head']  # (batch, H, W, 2)
-
-def __proc_np_hv(pred, GT=False):
+def __proc_np_hv(pred, GT=False, trhld=0.58):
     """Process Nuclei Prediction with XY Coordinate Map.
 
     Args:
@@ -189,14 +122,18 @@ def __proc_np_hv(pred, GT=False):
     overall[blb>0] = 3
     #plt.imshow(overall)
     #plt.show()
-    treshold = 0.4 if GT else 0.5
+    treshold = 0.45 if GT else trhld
     boundary_mask = overall > treshold  # es. 0.4
     kernel = np.ones((3,3),np.uint8)
     boundary_mask = boundary_mask.astype(np.uint8)
-    boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2)
-    
+    boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2) if not GT else boundary_mask
     from skimage.measure import label
     markers = label(1-boundary_mask_)
+    fig, axs = plt.subplots(1,3, figsize = (8,8))
+    axs[0].imshow(boundary_mask_)
+    axs[1].imshow(markers)
+    axs[2].imshow(overall)
+    plt.show()
     #print("label markers: ", list(np.unique(markers)))
     from skimage.segmentation import watershed
     blb_ = 1-blb
@@ -225,7 +162,7 @@ def count_blob(labels, blb, GT=False):
     #print(np.unique(labels))
     isolated_count = 0
     cluster_count = 0
-
+    print(np.unique(labels))
     for label in np.unique(labels):
         if label <= 0:
             continue
@@ -233,9 +170,32 @@ def count_blob(labels, blb, GT=False):
         single_mask = (labels == label).astype(np.uint8) * 255
 
         cnts, _ = cv2.findContours(single_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        treshold = 3 if GT else 12
-        if not cnts or len(cnts[0]) < treshold:
-            print("SKIPP")
+        treshold = 1 if GT else 11
+        
+        def debug_visual(label, single_mask, labels, blb_uint8, contour_img):
+            fig, axs = plt.subplots(1, 4, figsize=(16, 4))
+
+            axs[0].imshow(single_mask, cmap='gray')
+            axs[0].set_title(f"Mask for label {label}")
+
+            axs[1].imshow(labels, cmap='nipy_spectral')
+            axs[1].set_title("Labels")
+
+            axs[2].imshow(blb_uint8, cmap='gray')
+            axs[2].set_title("blb_uint8")
+
+            axs[3].imshow(contour_img)
+            axs[3].set_title("Contours")
+
+            for ax in axs:
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.show()
+        
+        if not cnts or all(len(c) < treshold for c in cnts):
+            print(f"SKIPP - label {label}, {cnts}")
+            #debug_visual(label, single_mask, labels, blb_uint8, contour_img)
             continue
 
         cntr = cnts[0]
@@ -256,46 +216,165 @@ def count_blob(labels, blb, GT=False):
 
     return (contour_img, isolated_count, cluster_count)
 
-# Watershed + HV map visualization and segmentation
-for i in range(X_train.shape[0]):
-    img = X_train[i]
-    seg = seg_preds[i]
-    hv = hv_preds[i]
-    hv_t = HV_train[i]
+def calc_print_outcome(X_train, HV_train, Y_train, model):
+    preds = model.predict(X_train)
+    seg_preds = preds['seg_head']
+    hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+    for i in range(X_train.shape[0]):
+        img = X_train[i]
+        seg = seg_preds[i]
+        hv = hv_preds[i]
+        hv_t = HV_train[i]
 
-    body_prob = seg[..., 0]
-    border_prob = seg[..., 2]
-    bg_prob = seg[..., 1]
-    
-    # mappa di probabilità nuclei
-    prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
-    pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
+        body_prob = seg[..., 0]
+        border_prob = seg[..., 2]
+        bg_prob = seg[..., 1]
 
-    # segmentazione con watershed guidata da HV map
-    label_map = __proc_np_hv(pred)
-    #plt.imshow(hv_t[...,1])
-    #plt.show()
-    print(Y_train[i].shape, hv_t[..., 0].shape)
-    pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
-    label_map_GT = __proc_np_hv(pred_GT, GT=True)
-    contour_img_blb, isolated_count_blb, cluster_blb = count_blob(label_map, prob_nucleus)
-    contour_img_hv, isolated_count_hv, cluster_hv = count_blob(label_map_GT, Y_train[i], GT=True)
-    print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
-    # visualizzazione
+        # mappa di probabilità nuclei
+        prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+        pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
+
+        # segmentazione con watershed guidata da HV map
+        label_map = __proc_np_hv(pred)
+
+        print(Y_train[i].shape, hv_t[..., 0].shape)
+        pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+        label_map_GT = __proc_np_hv(pred_GT, GT=True)
+        contour_img_blb, isolated_count_blb, cluster_blb = count_blob(label_map, prob_nucleus)
+        contour_img_gt, isolated_count_hv, cluster_hv = count_blob(label_map_GT, Y_train[i], GT=True)
+        print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
+        # visualizzazione
+        print_results(img, prob_nucleus, contour_img_gt, label_map, hv_t[...,0], contour_img_blb, isolated_count_blb, isolated_count_gt)
+
+def print_results(img, blb, countour_GT, labels, hv_map, countour_blb, isolated_count_blb, isolated_count_gt):
     fig, axs = plt.subplots(2,3,figsize=(8,8))
-    fig.suptitle(f"Binart nuceli count: {isolated_count_blb}, GT nuclei count: {isolated_count_hv}", fontsize=14)
+    fig.suptitle(f"Binart nuceli count: {isolated_count_blb}, GT nuclei count: {isolated_count_gt}", fontsize=14)
     axs[0,0].imshow(img)
     axs[0,0].set_title('Input Grayscale')
-    axs[0,1].imshow(prob_nucleus,cmap='gray')
+    axs[0,1].imshow(blb,cmap='gray')
     axs[0,1].set_title('Binary pred')
-    axs[0,2].imshow(contour_img_hv)
+    axs[0,2].imshow(countour_GT)
     axs[0,2].set_title('Count GT')
-    axs[1,0].imshow(label_map, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
+    axs[1,0].imshow(labels, cmap='nipy_spectral', vmin=0, vmax=label_map.max())
     axs[1,0].set_title("Segmentazione HV-Watershed")
-    axs[1,1].imshow(hv_t[...,0])
+    axs[1,1].imshow(hv_map)
     axs[1,1].set_title("Distance map X")
-    axs[1,2].imshow(contour_img_blb)
+    axs[1,2].imshow(countour_blb)
     axs[1,2].set_title("Count Binary Pred")
     plt.tight_layout()
     plt.show()
+# Load data
+base = os.path.join('data', 'raw')
+folds = [
+    (os.path.join(base,'Fold 3', 'images', 'images.npy'),
+     os.path.join(base,'Fold 3', 'masks', 'binary_masks.npy'),
+     os.path.join(base, 'Fold 3','masks', 'distance.npy'))
+]
+
+N = 14
+imgs_list, masks_list, dmaps_list = [], [], []
+SEED = 42
+
+for i, (img_path, mask_path, dist_path) in enumerate(folds):
+    rng = np.random.default_rng(SEED + i)
+    imgs = np.load(img_path, mmap_mode='r')
+    masks = np.load(mask_path, mmap_mode='r')
+    dmaps = np.load(dist_path, mmap_mode='r')
+    
+    #idxs = rng.choice(len(imgs), size=N, replace=False)
+    imgs_list.append(imgs)
+    masks_list.append(masks)
+    dmaps_list.append(dmaps)
+
+X = np.concatenate(imgs_list, axis=0)
+Y = np.concatenate(masks_list, axis=0)
+HV = np.concatenate(dmaps_list, axis=0)
+
+# Preprocess input images
+X = X + 15
+X_gray = X / 255
+#X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
+mean = X_gray.mean(axis=(0, 1, 2), keepdims=True)
+Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
+
+# Split
+X_train, _, Y_train, _, HV_train, _ = train_test_split(
+    Xc, Y, HV, test_size=0.1, random_state=SEED
+)
+#X_train_rgb = np.repeat(X_train, 3, axis=-1)
+X_train_rgb = X_train
+# Load model
+from src.losses import bce_dice_loss,hover_loss_fixed
+checkpoint_path='models/checkpoints/model_RGB_HV_v2.keras'
+
+model = load_model(
+    checkpoint_path,
+    custom_objects={
+        "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
+        "HVLoss": hover_loss_fixed
+    },
+    compile=False                    # ← evita la ricompilazione automatica
+)
+
+# --------------------------------------------
+# 3) ricompila con le tue loss/optimizer
+# --------------------------------------------
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3),
+    loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
+    loss_weights={"seg_head": 1.0, "hv_head": 0.5},
+)
+preds = model.predict(X_train_rgb)
+seg_preds = preds['seg_head']
+hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+# Watershed + HV map visualization and segmentation
+floats = np.arange(0.30, 0.61, 0.01)
+floats = np.round(floats, 2)  # per evitare problemi di arrotondamento
+errors = []
+for thld in floats:
+    total_gt = 0
+    total_pred = 0
+    for i in range(X_train.shape[0]):
+        img = X_train[i]
+        seg = seg_preds[i]
+        hv = hv_preds[i]
+        hv_t = HV_train[i]
+
+        body_prob = seg[..., 0]
+        border_prob = seg[..., 2]
+        bg_prob = seg[..., 1]
+
+        # mappa di probabilità nuclei
+        prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+        pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
+
+        # segmentazione con watershed guidata da HV map
+        label_map = __proc_np_hv(pred,trhld=thld)
+
+        print(Y_train[i].shape, hv_t[..., 0].shape)
+        pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+        label_map_GT = __proc_np_hv(pred_GT, GT=True)
+        _, isolated_count_pred, _ = count_blob(label_map, prob_nucleus)
+        _, isolated_count_gt, _ = count_blob(label_map_GT, Y_train[i], GT=True)
+        
+        total_gt += isolated_count_gt
+        total_pred += isolated_count_pred
+
+    abs_error = abs(total_gt - total_pred)
+    rel_error = abs_error / total_gt if total_gt > 0 else float('inf')
+    errors.append((thld, abs_error, rel_error))
+    # Ordina per errore relativo
+errors.sort(key=lambda x: x[2])
+best_threshold = errors[0][0]
+print(f"Miglior treshold: {best_threshold}")
+
+#grafico errore
+
+plt.plot(floats, [e[2] for e in errors])
+plt.xlabel("Treshold")
+plt.ylabel("Relative Error")
+plt.title("Treshold optimization")
+plt.grid(True)
+plt.show()
 

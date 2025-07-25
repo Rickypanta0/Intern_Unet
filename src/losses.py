@@ -18,7 +18,7 @@ from keras.saving import register_keras_serializable
 
 @register_keras_serializable()
 def hover_loss_fixed(y_true, y_pred):
-    return hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0)(y_true, y_pred)
+    return hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0)(y_true, y_pred)#Oppure mettere direttamete 4.0
 
 @register_keras_serializable()
 def hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0):

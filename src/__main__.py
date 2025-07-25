@@ -99,92 +99,8 @@ BACKBONE = 'resnet34'
         yz_np = yz.numpy().astype(np.uint8)
 
         return xz_np, yz_np, hv_np_f
-
-    def _make_target_3ch(self, m2: np.ndarray) -> np.ndarray:
-        #Dalla maschera 2D binaria (H,W) ritorna (H,W,3) [body,bg,border].
-        struct = np.ones((3,3), dtype=bool)
-        body       = binary_erosion(m2, structure=struct).astype(np.uint8)
-        border     = (m2 - body).clip(0,1).astype(np.uint8)
-        background = (1 - m2).astype(np.uint8)
-        return np.stack([body, background, border], axis=-1)
-
-
-    def __data_generation(self, list_temp):
-        # numero di augmentazioni per sample
-        n_aug =  1  # 4 zoom + flipLR + flipUD, ad esempio
-        batch_n = len(list_temp) * n_aug
-
-        # dimensioni immagine
-        if self.patch_size is None:
-            sample_img = np.load(self.folds[0][0], mmap_mode='r')[0]
-            H, W, C = sample_img.shape
-        else:
-            H = W = self.patch_size
-            C = 3
-        
-        # pre-allocazione
-        Xb = np.empty((batch_n, H, W, C), dtype=np.float32)
-        Yb = np.empty((batch_n, H, W, 3),   dtype=np.float32)#uint8
-        HVb = np.empty((batch_n, H, W, 2), dtype=np.float32)
-
-        k = 0   # contatore totale delle righe di Xb/Yb
-
-        for idx in list_temp:
-            img_ = (self.X[idx]).astype(np.float32)
-            img_ = img_ + 15
-            img_ = img_ / 255      # np.ndarray (H,W,C), valori 0–255
-            img_gray = np.dot(img_[...,:3], [0.2989, 0.5870, 0.1140])
-            img = img_gray[..., np.newaxis].astype(np.float32)  # (H,W,1)
-            
-            hv_map = self.Z[idx]  # shape (H,W,6)
-            #instance_map = build_instance_map_valuewise(mask_6ch)  # definita prima
-            #img_input = instance_map[..., np.newaxis]
-#
-            ## HV map tramite GenInstanceHV
-            #gen = GenInstanceHV(crop_shape=instance_map.shape)
-            #img_out = gen._augment(img_input, None)
-            #hv_map = img_out[..., 1:3]  # (H,W,2)
-
-            #print(img.shape)
-            raw = self.Y[idx]          # np.ndarray (H,W,1)
-            msk = np.squeeze(raw, axis=-1) if raw.ndim == 3 and raw.shape[-1] == 1 else raw           # ora (H,W)
-
-            # 1) originale
-            Xb[k] = img.astype(np.float32)
-            Yb[k] = self._make_target_3ch(msk)
-            HVb[k] = hv_map
-            k += 1
-            """"""
-            # 2) zoom augmentations (4 seed diversi)
-            #for j in range(1):
-            #    seed = (idx * 31 + j * 17, idx * 127 + j * 29)  # o qualunque combinazione di int
-            #    xz, yz, hv_n = self.augm(seed, img, msk,hv_map, zoom_size=180, IMG_SIZE=256)
-            #    Xb[k] = xz
-            #    yz_ = np.squeeze(yz, axis=-1) if yz.ndim == 3 and yz.shape[-1] == 1 else yz
-            #    HVb[k] = hv_n
-            #    Yb[k] = self._make_target_3ch(yz_)
-            #    k += 1
-            # 3) flip left–right
-            #img_lr = np.fliplr(img)
-            #mask_lr = np.fliplr(msk)
-            #hv_map_lr = np.fliplr(hv_map)
-            #Xb[k] = img_lr.astype(np.float32)
-            #Yb[k] = self._make_target_3ch(mask_lr)
-            #HVb[k] = hv_map_lr
-            #k += 1
-#
-            ## 4) flip up–down
-            #img_ud = np.flipud(img)
-            #mask_ud= np.flipud(msk)
-            #hv_map_ud= np.flipud(hv_map)
-            #Xb[k] = img_ud.astype(np.float32)
-            #Yb[k] = self._make_target_3ch(mask_ud)
-            #HVb[k] = hv_map_ud
-            #k += 1
-        preprocess_input = sm.get_preprocessing(BACKBONE)
-        Xb = preprocess_input(Xb)
-        return Xb, {'seg_head': Yb, 'hv_head': HVb}
     """
+from skimage.color import rgb2hed, hed2rgb
 class DataGenerator(keras.utils.Sequence):
     def __init__(self, folds, list_IDs, batch_size=1, patch_size=None,
                  shuffle=True, augment=True, skip_empty=True):
@@ -197,55 +113,7 @@ class DataGenerator(keras.utils.Sequence):
         self.preprocess_input = sm.get_preprocessing(BACKBONE)
         self.list_IDs = np.asarray(list_IDs)  # global indices
         self.ratio = 2
-        """
-        # Build global index map: global_idx -> (fold_idx, local_idx)
-        self.sample_map = []
-        self.class_flag = []      # 1 se positivo, 0 se negativo
 
-        for fold_idx, (_, mask_path, _) in enumerate(folds):
-            masks = np.load(mask_path, mmap_mode='r')
-            n_samples = masks.shape[0]
-            has_pos = masks.reshape(n_samples, -1).any(axis=1)
-            for local_idx, flag in enumerate(has_pos):
-                self.sample_map.append((fold_idx, local_idx))
-                self.class_flag.append(int(flag))
-
-        self.sample_map   = np.asarray(self.sample_map)
-        self.class_flag   = np.asarray(self.class_flag)
-
-        counts = np.bincount(self.class_flag)    # [negativi, positivi]
-        N_neg, N_pos = counts[0], counts[1]
-
-        # ------- 1. quota di probabilità per ciascuna classe -------------
-        P_pos_tot = self.ratio   / (self.ratio + 1)
-        P_neg_tot = 1           / (self.ratio + 1)
-
-        # ------- 2. probabilità per singolo campione ---------------------
-        prob_per_pos = P_pos_tot / N_pos
-        prob_per_neg = P_neg_tot / N_neg
-
-        sample_prob = np.where(self.class_flag == 1,
-                               prob_per_pos,
-                               prob_per_neg)
-
-        # ---------- 2. calcola pesi campione --------------------------
-        #counts          = np.bincount(self.class_flag)    # [neg, pos]
-        #class_weight    = 1.0 / np.maximum(counts, 1)     # evita div/0
-        #sample_weight   = class_weight[self.class_flag]   # peso per sample
-
-        # mantieni solo i pesi per l’insieme train/val passato
-        self.sample_weight = sample_prob[self.list_IDs]
-        self.prob          = self.sample_weight / self.sample_weight.sum()
-
-        # ---------- 3. default_shape per allocazioni batch ------------
-        self.default_shape = np.load(folds[0][0], mmap_mode='r')[0].shape
-        #    for i in range(n_samples):
-        #        self.sample_map.append((fold_idx, i))
-    #
-        #sample_img = np.load(folds[0][0], mmap_mode='r')[0]
-        #self.default_shape = sample_img.shape
-        self.on_epoch_end()
-        """
         self.sample_map = []
         for fold_idx, (img_path, _, _) in enumerate(folds):
             n_samples = np.load(img_path, mmap_mode='r').shape[0]
@@ -401,6 +269,20 @@ class DataGenerator(keras.utils.Sequence):
 
             img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
             img_rgb = (img + 15) / 255.0
+            
+            #HESOINE EXTRACTION
+            
+            ##ihc_hed = rgb2hed(img_rgb)
+
+            # Create an RGB image for each of the stains
+            ##null = np.zeros_like(ihc_hed[:, :, 0])
+            ##img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
+            
+            #BLU CHANNEL
+            
+            
+            
+            #GRAY SCALE
             #img_gray = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
             #img_gray = img_gray[..., np.newaxis]
             #img_rgb = np.repeat(img_gray, 3, axis=-1)
@@ -504,8 +386,8 @@ if __name__=="__main__":
             restore_best_weights=True
         )
     Xb, Yb = train_gen[0]
-    #idx = np.random.randint(Xb.shape[0]-14)
-    idx = 0
+    idx = np.random.randint(Xb.shape[0]-14)
+    
     print(Xb.shape, Yb['seg_head'].shape, Yb['hv_head'].shape)
 
     hv_batch = Yb['hv_head']
@@ -539,39 +421,12 @@ if __name__=="__main__":
             ],
             verbose=1)
     """
+    
+    #SECONDO ROUND
+    from src.model import CellDice
     from src.losses import bce_dice_loss,hover_loss_fixed
     from tensorflow.keras.utils import register_keras_serializable
-    
-    @register_keras_serializable()
-    class CellDice(tf.keras.metrics.Metric):
-        """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
-
-        def __init__(self, name="cell_dice", smooth=1e-6, **kw):
-            super().__init__(name=name, **kw)
-            self.smooth = smooth
-            self.intersection = self.add_weight(name="inter", initializer="zeros")
-            self.union        = self.add_weight(name="union", initializer="zeros")
-
-        def _bin_mask(self, y):
-            body, bg, border = tf.unstack(y, axis=-1)
-            return tf.cast(body + border > bg, tf.float32)
-
-        def update_state(self, y_true, y_pred, sample_weight=None):
-            y_true_b = self._bin_mask(y_true)           # bool
-            y_pred_b = self._bin_mask(y_pred)
-
-            inter = tf.reduce_sum(y_true_b * y_pred_b)
-            union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
-            self.intersection.assign_add(inter)
-            self.union.assign_add(union)
-
-        def result(self):
-            return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
-
-        def reset_state(self):
-            self.intersection.assign(0.0)
-            self.union.assign(0.0)
-
+    """
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-3,
         first_decay_steps=10 * len(train_gen),   # es.: 10 epoche
@@ -594,12 +449,49 @@ if __name__=="__main__":
         optimizer=optimizer,
         loss={'seg_head': bce_dice_loss,
               'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 1.0, 'hv_head': 0.1},
+        loss_weights={'seg_head': 1.0, 'hv_head': 1.0},
         metrics={'seg_head': [CellDice()], 'hv_head': []}
     )
 
     # 3. Continua l’addestramento
     history = best.fit(train_gen,
+                       validation_data=val_gen,
+                       epochs=20,             # numero epoche aggiuntive
+                       callbacks=[checkpoint_cb, earlystop_cb],
+                       verbose=1)
+    """
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=1e-4,
+        first_decay_steps=10 * len(train_gen),   # es.: 10 epoche
+        alpha=0.5
+    )
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    model = tf.keras.models.load_model(
+        "models/checkpoints/model_RGB_HV_v2.keras",
+        custom_objects={"CellDice": CellDice,
+                        "bce_dice_loss": bce_dice_loss,
+                        "hover_loss_fixed": hover_loss_fixed}
+    )
+    for layer in model.get_layer('hv_head').layers:   # se è un nested model
+        layer.trainable = False
+    # 2. Ricompila con loss_weights nuovi e/o LR schedule diverso
+    model.compile(
+        optimizer=optimizer,
+        loss={'seg_head': bce_dice_loss,
+              'hv_head' : hover_loss_fixed},
+        loss_weights={'seg_head': 1.0, 'hv_head': 0.05},
+        metrics={'seg_head': [CellDice()], 'hv_head': []}
+    )
+    earlystop_cb = tf.keras.callbacks.EarlyStopping(
+        monitor='val_seg_head_cell_dice',
+        mode='max',
+        patience=4,
+        restore_best_weights=True
+    )
+    # 3. Continua l’addestramento
+    history = model.fit(train_gen,
                        validation_data=val_gen,
                        epochs=20,             # numero epoche aggiuntive
                        callbacks=[checkpoint_cb, earlystop_cb],
