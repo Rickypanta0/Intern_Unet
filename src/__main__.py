@@ -2,15 +2,12 @@
 import os
 import tensorflow as tf
 import numpy as np
-from sklearn.model_selection import train_test_split
-
-from .utils.visualization import show_threshold_pairs_test
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
 from src.model import get_model_paper, build_unet_with_resnet50
-from src.callbacks import get_callbacks
 import math 
 from tensorflow import keras 
+from matplotlib.cm import get_cmap
 import tensorflow_io as tfio
 import segmentation_models as sm
 #from src.test_augm import build_instance_map_valuewise, GenInstanceHV
@@ -272,15 +269,17 @@ class DataGenerator(keras.utils.Sequence):
             
             #HESOINE EXTRACTION
             
-            ##ihc_hed = rgb2hed(img_rgb)
-
-            # Create an RGB image for each of the stains
-            ##null = np.zeros_like(ihc_hed[:, :, 0])
-            ##img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
+            #ihc_hed = rgb2hed(img_rgb)
+#
+            ## Create an RGB image for each of the stains
+            #null = np.zeros_like(ihc_hed[:, :, 0])
+            #img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
             
             #BLU CHANNEL
             
-            
+            #blu = img_rgb[i,...,2]
+            #cmap = get_cmap('Blues')
+            #img_rgb = cmap(blu)[:, :, :3] 
             
             #GRAY SCALE
             #img_gray = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
@@ -305,14 +304,11 @@ class DataGenerator(keras.utils.Sequence):
                     img_rgb = np.flipud(img_rgb)
                     mask   = np.flipud(mask)
                     hv      = np.flipud(hv)
-                k = np.random.randint(4) #tf.random.uniform([],0,4,dtype=tf.int32)
+                k = np.random.randint(4) 
                 #print(mask.shape)
                 img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
                 mask   = np.rot90(mask,   k, axes=(0, 1))
                 hv      = np.rot90(hv,      k, axes=(0, 1))
-                #if np.random.rand() < 0.5:
-                #    seed = (31 + i * 17, 127 + i * 29)
-                #    img_rgb, mask, hv = self.augm(seed,img_rgb,mask,hv,zoom_size=150, IMG_SIZE=256)
 
             X[i] = img_rgb
             Y[i] = mask
@@ -352,7 +348,7 @@ if __name__=="__main__":
         tf.config.experimental.set_memory_growth(gpus[0], True)
     SEED = 42
     np.random.seed = SEED
-    base = os.path.join( 'data','raw')
+    base = os.path.join( 'data','raw_neoplastic')
     folds = [
         (os.path.join(base, 'Fold 1', 'images', 'images.npy'),
          os.path.join(base, 'Fold 1', 'masks', 'binary_masks.npy'),
@@ -383,7 +379,7 @@ if __name__=="__main__":
         factor=0.5,
         patience=3,
         min_lr=1e-5,
-        mode="min",
+        mode="max",
         verbose=1
     )
 
@@ -392,7 +388,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/model_RGB_HV_v4.keras'
+    checkpoint_path='models/checkpoints/neo/model_RGB.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -435,7 +431,7 @@ if __name__=="__main__":
     
         plt.tight_layout()
         plt.show()
-    """
+    
     model = get_model_paper()
 
     history = model.fit(train_gen,
@@ -447,13 +443,13 @@ if __name__=="__main__":
                 tensorboard_cb,
             ],
             verbose=1)
+
     """
-    
     #SECONDO ROUND
     
     from src.losses import bce_dice_loss,hover_loss_fixed
     from tensorflow.keras.utils import register_keras_serializable
-    """
+    
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-3,
         first_decay_steps=10 * len(train_gen),   # es.: 10 epoche
@@ -465,7 +461,7 @@ if __name__=="__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
     best = tf.keras.models.load_model(
-        "models/checkpoints/model_RGB_HV_v2.keras",
+        "models/checkpoints/model_HE_HV.keras",
         custom_objects={"CellDice": CellDice,
                         "bce_dice_loss": bce_dice_loss,
                         "hover_loss_fixed": hover_loss_fixed}
@@ -476,7 +472,7 @@ if __name__=="__main__":
         optimizer=optimizer,
         loss={'seg_head': bce_dice_loss,
               'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 1.0, 'hv_head': 1.0},
+        loss_weights={'seg_head': 1.0, 'hv_head': 0.05},
         metrics={'seg_head': [CellDice()], 'hv_head': []}
     )
 
@@ -486,6 +482,7 @@ if __name__=="__main__":
                        epochs=20,             # numero epoche aggiuntive
                        callbacks=[checkpoint_cb, earlystop_cb],
                        verbose=1)
+    """
     """
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-4,
@@ -553,6 +550,7 @@ if __name__=="__main__":
                        epochs=20,             # numero epoche aggiuntive
                        callbacks=[checkpoint_cb, earlystop_cb],
                        verbose=1)
+    """
     #OVERFITTING ?
     hist = history.history           # dizionario {metric_name: [e1, e2, ...]}
 
@@ -562,82 +560,5 @@ if __name__=="__main__":
     plt.xlabel('Epoch'); plt.ylabel('Loss')
     plt.title('Loss curves'); plt.legend(); plt.tight_layout()
     plt.show()
-
-    """
-    from segmentation_models import Unet, get_preprocessing
-    from segmentation_models.utils import set_trainable
-
-    #preprocess_input = get_preprocessing(BACKBONE)
-    #train_gen = preprocess_input(train_gen)
-    #val_gen = preprocess_input(val_gen)
-
-    # Costruzione del backbone base da segmentation_models
-    base_unet = Unet(
-        backbone_name=BACKBONE,
-        encoder_weights='imagenet',
-        input_shape=(256, 256, 3),
-        decoder_block_type='upsampling',
-        decoder_use_batchnorm=True,
-        decoder_filters=(512,256,128,64,32),
-        encoder_freeze=True,
-        activation=None  # niente attivazione sull'output di default
-    )
-
-    # Output intermedio dell'ultimo layer del decoder
-    decoder_output = base_unet.output
-
-    # Testa segmentazione (3 classi - softmax)
-    seg_head = tf.keras.layers.Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
-    seg_head = tf.keras.layers.Conv2D(3, (1, 1), activation='softmax', name='seg_head')(seg_head)
-
-    # Testa HV (2 canali - regressione)
-    hv_head = tf.keras.layers.Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
-    hv_head = tf.keras.layers.Conv2D(2, (1, 1), activation='linear', name='hv_head')(hv_head)
-
-    # Modello finale multi-output
-    model = tf.keras.Model(inputs=base_unet.input, outputs={'seg_head': seg_head, 'hv_head': hv_head})
-
-    # Compilazione con le loss desiderate
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss={
-            'seg_head': bce_dice_loss,
-            'hv_head': hover_loss_fixed
-        },
-        loss_weights={
-            'seg_head': 1.0,
-            'hv_head': 2.0
-        }
-    )
-
-    model.fit(train_gen,
-              validation_data=val_gen,
-              epochs=50,
-              callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
-              verbose=1)
-
-    # Sblocco encoder
-    for layer in model.layers:
-        layer.trainable = True
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss={
-            'seg_head': bce_dice_loss,
-            'hv_head': hover_loss_fixed
-        },
-        loss_weights={
-            'seg_head': 1.0,
-            'hv_head': 2.0
-        }
-    )
-
-    # Allenamento completo
-    model.fit(train_gen,
-              validation_data=val_gen,
-              epochs=50,
-              callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
-              verbose=1)
-
-
-    """
+    
+    

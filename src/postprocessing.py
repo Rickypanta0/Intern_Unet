@@ -74,7 +74,7 @@ def remove_small_objects(pred, min_size=64, connectivity=1):
 
     return out
 
-def __proc_np_hv(pred, GT=False, trhld=0.56):
+def __proc_np_hv(pred, GT=False, trhld=0.55):
     """Process Nuclei Prediction with XY Coordinate Map.
 
     Args:

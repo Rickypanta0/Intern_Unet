@@ -1,6 +1,5 @@
 print(f"Eseguito: {__file__}")
 
-from .data_loader import load_folds
 import os
 import tensorflow as tf
 import numpy as np
@@ -321,7 +320,7 @@ from tqdm import tqdm
 def build_instance_map(mask_6ch):
     instance_map = np.zeros(mask_6ch.shape[:2], dtype=np.uint16)
     current_id = 1
-    for ch in range(5):
+    for ch in range(2):
         channel = mask_6ch[..., ch]
         labeled, n = label(channel > 0)
         if n > 0:
@@ -357,17 +356,17 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
         #plt.show()
 
         #create binary masks with only neoplastic cells
-        blb = mask[...,5]
-        #blb = np.where(instance_map!=0, 1.0, 0.0).astype(np.float32)[..., np.newaxis]
-        blbs[i] = blb[...,np.newaxis]
+        #blb = mask[...,5]
+        blbs[i] = np.where(instance_map!=0, 1.0, 0.0).astype(np.float32)[..., np.newaxis]
+        #blbs[i] = blb[...,np.newaxis]
         
-        if np.random.rand() < 0.25 and count<30:
-            count+=1
-            fig, axs = plt.subplots(1,3,figsize=(8,8))
-            axs[0].imshow(blb, cmap='gray')
-            axs[1].imshow(out[...,1])
-            axs[2].imshow(instance_input)
-            plt.show()
+        #if np.random.rand() < 0.25 and count<30:
+        #    count+=1
+        #    fig, axs = plt.subplots(1,3,figsize=(8,8))
+        #    axs[0].imshow(blbs[i], cmap='gray')
+        #    axs[1].imshow(out[...,1])
+        #    axs[2].imshow(instance_input)
+        #    plt.show()
 
     # Salva
     binary_path = os.path.join(os.path.dirname(masks_path), "binary_masks.npy")
@@ -378,9 +377,9 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
     print(f"Salvato: {out_path}")
 
 # Esempio d'uso
-folds = [os.path.join('data', 'raw', 'Fold 2', 'masks', 'masks.npy'),
-         os.path.join('data', 'raw', 'Fold 3', 'masks', 'masks.npy'),
-        os.path.join('data', 'raw', 'Fold 1', 'masks', 'masks.npy')] 
+folds = [os.path.join('data', 'raw_neoplastic', 'Fold 2', 'masks', 'masks.npy'),
+         os.path.join('data', 'raw_neoplastic', 'Fold 3', 'masks', 'masks.npy'),
+        os.path.join('data', 'raw_neoplastic', 'Fold 1', 'masks', 'masks.npy')] 
 
 
 

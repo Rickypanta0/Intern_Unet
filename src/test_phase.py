@@ -6,8 +6,9 @@ from src.losses import bce_dice_loss, hover_loss_fixed
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import load_model
 import tensorflow as tf
-from skimage.color import rgb2hed, hed2rgb, separate_stains,bro_from_rgb
+from skimage.color import rgb2hed, hed2rgb
 from tqdm import tqdm
+from matplotlib.cm import get_cmap
 
 def HE_deconv(img):
     ihc_hed = rgb2hed(img)
@@ -111,27 +112,36 @@ Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
-X = X + 15
+X = X - 0
 X = X / 255
 k = min(4, X.shape[0])                                 # quante immagini mostrare
 high = max(1, X.shape[0] - (k - 5))                    # ultimo indice di partenza valido + 1
 idx = np.random.randint(0, high)  
 
+
+
+
 for i in range(idx,idx+5):
     ihc_h, ihc_e, ihc_d = HE_deconv(X[i])
     
+    blu = X[i,...,2]
+    cmap = get_cmap('Blues')
+    channel3_rgb = cmap(blu)[:, :, :3] 
+
     fig, axs = plt.subplots(1,3,figsize=(8,8))
     axs[0].imshow(X[i])
     axs[1].imshow(ihc_h)
-    axs[2].imshow(1-X[i,...,2])
+    axs[2].imshow(channel3_rgb)
     plt.tight_layout()
     plt.show()
 
-checkpoint_path='models/checkpoints/model_RGB_HV_v3.keras'
+checkpoint_path='models/checkpoints/model_HE_HV_v2.keras'
 
-model = loadmodel(checkpoint_path=checkpoint_path, weight_hv_head=0.05)
+model = loadmodel(checkpoint_path=checkpoint_path, weight_hv_head=0.5)
 preds = model.predict(X)
 grafo_diffusione(X,Y,HV,preds)
+
+
     
 
 

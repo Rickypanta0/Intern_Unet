@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import load_model
 import tensorflow as tf
 from tqdm import tqdm
+from skimage.color import rgb2hed, hed2rgb
 
 # Predict
 from scipy.ndimage import filters, measurements
@@ -290,18 +291,32 @@ HV = np.concatenate(dmaps_list, axis=0)
 X = X + 15
 X_gray = X / 255
 #X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
+#HESOINE EXTRACTION
+            
+def extract_hematoxylin_rgb(img):
+    ihc_hed = rgb2hed(img)
+    null = np.zeros_like(ihc_hed[:, :, 0])
+    h_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
+    
+    mean = h_rgb.mean(axis=(0, 1), keepdims=True)
+    h_rgb_norm = np.clip(mean + 1.4 * (h_rgb - mean), 0.0, 1.0)
+    
+    return h_rgb_norm.astype(np.float32)
+
+# Applica al batch
+X_processed = np.stack([extract_hematoxylin_rgb(img / 255.0) for img in X], axis=0) 
 mean = X_gray.mean(axis=(0, 1, 2), keepdims=True)
 Xc = np.clip(mean + 1.4 * (X_gray - mean), 0.0, 1.0)
 
 # Split
 X_train, _, Y_train, _, HV_train, _ = train_test_split(
-    Xc, Y, HV, test_size=0.1, random_state=SEED
+    X_processed, Y, HV, test_size=0.1, random_state=SEED
 )
 #X_train_rgb = np.repeat(X_train, 3, axis=-1)
 X_train_rgb = X_train
 # Load model
 from src.losses import bce_dice_loss,hover_loss_fixed
-checkpoint_path='models/checkpoints/model_RGB_HV_v2.keras'
+checkpoint_path='models/checkpoints/model_HE_HV.keras'
 
 model = load_model(
     checkpoint_path,
