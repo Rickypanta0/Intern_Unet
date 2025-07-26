@@ -319,7 +319,32 @@ class DataGenerator(keras.utils.Sequence):
             HV[i] = hv
 
         return X, {'seg_head': Y, 'hv_head': HV}
+from tensorflow.keras.utils import register_keras_serializable
     
+@register_keras_serializable()
+class CellDice(tf.keras.metrics.Metric):
+    """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
+    def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+        super().__init__(name=name, **kw)
+        self.smooth = smooth
+        self.intersection = self.add_weight(name="inter", initializer="zeros")
+        self.union        = self.add_weight(name="union", initializer="zeros")
+    def _bin_mask(self, y):
+        body, bg, border = tf.unstack(y, axis=-1)
+        return tf.cast(body + border > bg, tf.float32)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_b = self._bin_mask(y_true)           # bool
+        y_pred_b = self._bin_mask(y_pred)
+        inter = tf.reduce_sum(y_true_b * y_pred_b)
+        union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
+        self.intersection.assign_add(inter)
+        self.union.assign_add(union)
+    def result(self):
+        return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
+
 if __name__=="__main__":
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
@@ -367,7 +392,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/model_RGB_HV_v3.keras'
+    checkpoint_path='models/checkpoints/model_RGB_HV_v4.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -386,7 +411,9 @@ if __name__=="__main__":
             restore_best_weights=True
         )
     Xb, Yb = train_gen[0]
-    idx = np.random.randint(Xb.shape[0]-14)
+    k = min(4, Xb.shape[0])                                 # quante immagini mostrare
+    high = max(1, Xb.shape[0] - (k - 1))                    # ultimo indice di partenza valido + 1
+    idx = np.random.randint(0, high)    
     
     print(Xb.shape, Yb['seg_head'].shape, Yb['hv_head'].shape)
 
@@ -423,7 +450,7 @@ if __name__=="__main__":
     """
     
     #SECONDO ROUND
-    from src.model import CellDice
+    
     from src.losses import bce_dice_loss,hover_loss_fixed
     from tensorflow.keras.utils import register_keras_serializable
     """
@@ -474,14 +501,44 @@ if __name__=="__main__":
                         "bce_dice_loss": bce_dice_loss,
                         "hover_loss_fixed": hover_loss_fixed}
     )
-    for layer in model.get_layer('hv_head').layers:   # se è un nested model
-        layer.trainable = False
+    def ancestors(layer):
+        seen = set()
+        stack = [layer]
+        while stack:
+            L = stack.pop()
+            if L in seen:
+                continue
+            seen.add(L)
+            # percorri i nodi in ingresso al layer
+            for node in getattr(L, "_inbound_nodes", []):
+                for t in getattr(node, "input_tensors", []):
+                    # ogni tensor porta al layer sorgente tramite _keras_history
+                    src = getattr(getattr(t, "_keras_history", None), "layer", None)
+                    if src is not None:
+                        stack.append(src)
+        return seen
+
+    hv_layer  = model.get_layer("hv_head")
+    seg_layer = model.get_layer("seg_head")
+
+    hv_anc  = ancestors(hv_layer)
+    seg_anc = ancestors(seg_layer)
+
+    unique_hv_layers = hv_anc - seg_anc   # solo i layer della branchetta HV
+    unique_seg_layers = seg_anc - hv_anc
+
+    # Opzionale: togli InputLayer se presente
+    unique_hv_layers = {L for L in unique_hv_layers if L.__class__.__name__ != "InputLayer"}
+    unique_seg_layers = {L for L in unique_seg_layers if L.__class__.__name__ != "InputLayer"}
+
+    for L in unique_seg_layers:
+        L.trainable = False
     # 2. Ricompila con loss_weights nuovi e/o LR schedule diverso
     model.compile(
         optimizer=optimizer,
         loss={'seg_head': bce_dice_loss,
               'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 1.0, 'hv_head': 0.05},
+        loss_weights={'seg_head': 1.0, 'hv_head': 2.0},
         metrics={'seg_head': [CellDice()], 'hv_head': []}
     )
     earlystop_cb = tf.keras.callbacks.EarlyStopping(
