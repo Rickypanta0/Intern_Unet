@@ -357,7 +357,7 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
 
         #create binary masks with only neoplastic cells
         #blb = mask[...,5]
-        blbs[i] = np.where(instance_map!=0, 1.0, 0.0).astype(np.float32)[..., np.newaxis]
+        blbs[i] = np.where(instance_map!=0, 0.0, 1.0).astype(np.float32)[..., np.newaxis]
         #blbs[i] = blb[...,np.newaxis]
         
         #if np.random.rand() < 0.25 and count<30:

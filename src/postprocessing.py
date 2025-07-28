@@ -216,3 +216,28 @@ def count_blob(labels, blb, GT=False):
         isolated_count += 1
 
     return (contour_img, isolated_count, cluster_count)
+
+def nucle_counting(X_train, HV_train, Y_train, preds, i):
+    seg_preds = preds['seg_head']
+    hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+    
+    seg = seg_preds[i]
+    hv = hv_preds[i]
+    hv_t = HV_train[i]
+    body_prob = seg[..., 0]
+    border_prob = seg[..., 2]
+    bg_prob = seg[..., 1]
+    # mappa di probabilità nuclei
+    prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+    pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
+    # segmentazione con watershed guidata da HV map
+    label_map = __proc_np_hv(pred)
+    print(Y_train[i].shape, hv_t[..., 0].shape)
+    pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+    label_map_GT = __proc_np_hv(pred_GT, GT=True)
+    contour_img_blb, isolated_count_blb, _ = count_blob(label_map, prob_nucleus)
+    contour_img_gt, isolated_count_hv, _ = count_blob(label_map_GT, Y_train[i], GT=True)
+    #stampa
+    print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
+
+    return isolated_count_blb, contour_img_blb, isolated_count_hv, contour_img_gt

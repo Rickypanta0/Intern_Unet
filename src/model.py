@@ -5,7 +5,32 @@ Definizione dell'architettura U-Net e compilazione del modello mantenendo lo sti
 import tensorflow as tf
 from keras.metrics import MeanIoU
 #from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
+from src.losses import bce_dice_loss,hover_loss_fixed
+from tensorflow.keras.utils import register_keras_serializable
 
+@register_keras_serializable()
+class CellDice(tf.keras.metrics.Metric):
+    """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
+    def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+        super().__init__(name=name, **kw)
+        self.smooth = smooth
+        self.intersection = self.add_weight(name="inter", initializer="zeros")
+        self.union        = self.add_weight(name="union", initializer="zeros")
+    def _bin_mask(self, y):
+        body, bg, border = tf.unstack(y, axis=-1)
+        return tf.cast(body + border > bg, tf.float32)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_b = self._bin_mask(y_true)           # bool
+        y_pred_b = self._bin_mask(y_pred)
+        inter = tf.reduce_sum(y_true_b * y_pred_b)
+        union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
+        self.intersection.assign_add(inter)
+        self.union.assign_add(union)
+    def result(self):
+        return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
 
 def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
     """
@@ -215,38 +240,6 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     'seg_head': seg_head,
     'hv_head': hv_head
     })
-    from src.losses import bce_dice_loss,hover_loss_fixed
-    from tensorflow.keras.utils import register_keras_serializable
-    
-    @register_keras_serializable()
-    class CellDice(tf.keras.metrics.Metric):
-        """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
-
-        def __init__(self, name="cell_dice", smooth=1e-6, **kw):
-            super().__init__(name=name, **kw)
-            self.smooth = smooth
-            self.intersection = self.add_weight(name="inter", initializer="zeros")
-            self.union        = self.add_weight(name="union", initializer="zeros")
-
-        def _bin_mask(self, y):
-            body, bg, border = tf.unstack(y, axis=-1)
-            return tf.cast(body + border > bg, tf.float32)
-
-        def update_state(self, y_true, y_pred, sample_weight=None):
-            y_true_b = self._bin_mask(y_true)           # bool
-            y_pred_b = self._bin_mask(y_pred)
-
-            inter = tf.reduce_sum(y_true_b * y_pred_b)
-            union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
-            self.intersection.assign_add(inter)
-            self.union.assign_add(union)
-
-        def result(self):
-            return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
-
-        def reset_state(self):
-            self.intersection.assign(0.0)
-            self.union.assign(0.0)
 
     #import tensorflow_addons as tfa
     #dice_metric = tfa.metrics.F1Score(
@@ -272,10 +265,10 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 0.5
+        'hv_head': 1.0
     },
     metrics={'seg_head': [CellDice()],
-             'hv_head' : []}
+             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
 )
     
     return model
@@ -286,83 +279,97 @@ from tensorflow.keras.models import Model
 
 
 
-def build_unet_with_resnet50(input_shape=(256,256,3)):
+def model_paper_hover(input_shape=(256,256,3)):
     # 1) Input
     inputs = tf.keras.Input(shape=input_shape)
 
-    # 2) ResNet50 come encoder, usando il nostro Input
-    resnet = ResNet50(
-        include_top=False,
-        weights='imagenet',
-        input_tensor=inputs,
-        name='ResNet50',
-        classes=3,
-        classifier_activation='softmax'
+    inputs = tf.keras.Input(input_shape)
+
+    # ---- Encoder + Bottleneck ----
+    def conv_block(x, filters, dropout_rate):
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+        x = tf.keras.layers.Dropout(dropout_rate)(x)
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+        return x
+
+    c1 = conv_block(inputs, 32, 0.1)
+    p1 = tf.keras.layers.MaxPooling2D()(c1)
+
+    c2 = conv_block(p1, 64, 0.1)
+    p2 = tf.keras.layers.MaxPooling2D()(c2)
+
+    c3 = conv_block(p2, 128, 0.2)
+    p3 = tf.keras.layers.MaxPooling2D()(c3)
+
+    c5 = conv_block(p3, 256, 0.3)
+    p5 = tf.keras.layers.MaxPooling2D()(c5)
+
+    c6 = conv_block(p5, 512, 0.3)
+    u1 = tf.keras.layers.UpSampling2D()(c6)
+
+    # ---- Decoder shared ----
+    def up_block(u, skip, filters, dropout_rate):
+        x = tf.keras.layers.concatenate([u, skip])
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+        x = tf.keras.layers.Dropout(dropout_rate)(x)
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+        return tf.keras.layers.UpSampling2D()(x)
+
+    u2 = up_block(u1, c5, 256, 0.2)
+    u3 = up_block(u2, c3, 128, 0.2)
+    u4 = up_block(u3, c2, 64, 0.05)
+    shared = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu', kernel_initializer='he_normal')(u4)
+    # ---- HoVerNet-style seg_head ----
+    x = shared
+    for filters in [64, 64, 32]:
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+    seg_head = tf.keras.layers.Conv2D(3, 1, activation='softmax', name='seg_head')(x)
+
+    # ---- HoVerNet-style hv_head ----
+    x = shared
+    for filters in [64, 64, 32]:
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+    hv_head = tf.keras.layers.Conv2D(2, 1, activation='linear', name='hv_head')(x)
+    
+    model = tf.keras.Model(inputs=inputs, outputs={'seg_head': seg_head, 'hv_head': hv_head})
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=1e-3,
+        first_decay_steps=25,
+        t_mul=2.0,
+        m_mul=0.8,
+        alpha=1e-5 / 1e-3
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    model.compile(
+        optimizer=optimizer,
+        loss={
+            'seg_head': bce_dice_loss,
+            'hv_head': hover_loss_fixed
+        },
+        loss_weights={
+            'seg_head': 1.0,
+            'hv_head': 1.0
+        },
+        metrics={
+            'seg_head': [CellDice()],
+            'hv_head': [tf.keras.metrics.MeanSquaredError()]
+        }
     )
 
-    # 3) Definisci i nomi dei layer di cui prendere gli skip
-    skip_names = [
-        'conv1_relu',         # dopo il primo conv+bn+relu  => output  (H/2, W/2,   64)
-        'conv2_block3_out',   # fine del blocco 2         => output  (H/4, W/4,  256)
-        'conv3_block4_out',   # fine del blocco 3         => output  (H/8, W/8,  512)
-        'conv4_block6_out',   # fine del blocco 4         => output  (H/16,W/16,1024)
-    ]
-    # l’ultimo feature map (bottleneck) sarà il conv5_block3_out
-    bottleneck_name = 'conv5_block3_out'
-
-    # 4) Raccogli i tensori intermedi
-    skips = [resnet.get_layer(name).output for name in skip_names]
-    bottleneck = resnet.get_layer(bottleneck_name).output
-    
-    # 5) Decoder (mimando la tua struttura)
-    x = bottleneck
-    drop_rates = [0.3, 0.2, 0.2, 0.1]
-    filter_sizes = [256, 128, 64,  32]
-
-    for i, (skip, dr, fs) in enumerate(zip(reversed(skips), reversed(drop_rates), reversed(filter_sizes))):
-        x = UpSampling2D(size=(2,2), interpolation='nearest')(x)
-        x = concatenate([x, skip])
-        x = Conv2D(fs, (3,3), padding='same', kernel_initializer='he_normal')(x)
-        x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
-        x = Activation('relu')(x)
-        x = Dropout(dr)(x)
-        x = Conv2D(fs, (3,3), padding='same', kernel_initializer='he_normal')(x)
-        x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
-        x = Activation('relu')(x)
-
-    # 5) Ultimo upsampling per risalire da 128×128 a 256×256
-    x_ = UpSampling2D(size=(2,2), interpolation='nearest')(x)
-
-    # 6) Testata di segmentazione
-    x = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x_)
-    x = BatchNormalization(momentum=0.9, epsilon=1e-3)(x)
-    x = Activation('relu')(x)
-    x = Dropout(0.1)(x)
-    seg_head = Conv2D(
-        filters=3,
-        kernel_size=(1,1),
-        activation='softmax',
-        name='seg_head'
-    )(x)
-
-    xh = Conv2D(32, (3,3), padding='same', kernel_initializer='he_normal')(x_)
-    xh = BatchNormalization(momentum=0.9, epsilon=1e-3)(xh)
-    xh = Activation('relu')(xh)
-    xh = Dropout(0.1)(xh)
-    hv_head = tf.keras.layers.Conv2D(filters=2, kernel_size=(1, 1), activation='linear', name='hv_head')(xh)
-
-    # 7) Compila il modello
-    model = tf.keras.Model(inputs=inputs, outputs={
-    'seg_head': seg_head,
-    'hv_head': hv_head
-    })
-    #model.compile(
-    #    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-    #    loss=bce_dice_loss,
-    #    metrics=[tf.keras.metrics.MeanIoU(num_classes=3)]
-    #)
-    #model.summary()
-    model.backbone = resnet
     return model
 
 if __name__ == "__main__":

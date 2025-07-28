@@ -4,7 +4,7 @@ import tensorflow as tf
 import numpy as np
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
-from src.model import get_model_paper, build_unet_with_resnet50
+from src.model import get_model_paper, model_paper_hover
 import math 
 from tensorflow import keras 
 from matplotlib.cm import get_cmap
@@ -277,15 +277,16 @@ class DataGenerator(keras.utils.Sequence):
             
             #BLU CHANNEL
             
-            #blu = img_rgb[i,...,2]
+            #blu = img_rgb[...,2]
+            #blu_enhanced = np.clip(blu + 0.05, 0, 1)
             #cmap = get_cmap('Blues')
-            #img_rgb = cmap(blu)[:, :, :3] 
-            
-            #GRAY SCALE
-            #img_gray = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
-            #img_gray = img_gray[..., np.newaxis]
-            #img_rgb = np.repeat(img_gray, 3, axis=-1)
+            #img_rgb = cmap(blu_enhanced)[:, :, :3] 
 
+            #GRAY SCALE
+            img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
+            img_gray = img_gray[..., np.newaxis]
+            img_rgb = np.repeat(img_gray, 3, axis=-1)
+            
             mask = np.load(mask_path, mmap_mode='r')[local_idx]
         
             if mask.ndim == 3 and mask.shape[-1] == 1:
@@ -388,7 +389,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/neo/model_RGB.keras'
+    checkpoint_path='models/checkpoints/neo/model_Gray.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -424,7 +425,7 @@ if __name__=="__main__":
         border_mask = mask_3ch[..., 2].astype(np.uint8)
 
         C = np.logical_or(body_mask, border_mask).astype(np.uint8)
-        axs[0,0].imshow(Xb[i])                         # immagine normalizzata [0,1]
+        axs[0,0].imshow(Xb[i],cmap='gray')                         # immagine normalizzata [0,1]
         axs[0,1].imshow(C,  vmin=0, vmax=1)  # body
         axs[1,0].imshow(Yb['hv_head'][i, ..., 0])  # background
         axs[1,1].imshow(Yb['hv_head'][i, ..., 1])  # border
@@ -433,7 +434,7 @@ if __name__=="__main__":
         plt.show()
     
     model = get_model_paper()
-
+    model_ = model_paper_hover()
     history = model.fit(train_gen,
             validation_data=val_gen, 
             epochs=60, 
