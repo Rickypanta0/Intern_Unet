@@ -31,7 +31,7 @@ def print_results(img, blb, countour_GT, labels, hv_map, countour_blb, isolated_
     plt.tight_layout()
     plt.show()
 # Load data
-base = os.path.join('data', 'raw')
+base = os.path.join('data', 'raw_neoplastic')
 folds = [
     (os.path.join(base,'Fold 3', 'images', 'images.npy'),
      os.path.join(base,'Fold 3', 'masks', 'binary_masks.npy'),
@@ -60,7 +60,7 @@ HV = np.concatenate(dmaps_list, axis=0)
 # Preprocess input images
 X = X + 15
 X_gray = X / 255
-X_gray = np.dot(X_gray[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
+#X_gray = np.dot(X_gray[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
 #HESOINE EXTRACTION
             
 def extract_hematoxylin_rgb(img):
@@ -84,18 +84,18 @@ def extract_hematoxylin_rgb(img):
 #
 #    X_.append(img_rgb)
 #X_ = np.stack(X_,axis=0)
-X_ = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
+#X_ = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
 
 # Split
 X_train, _, Y_train, _, HV_train, _ = train_test_split(
-    X_, Y, HV, test_size=0.1, random_state=SEED
+    X_gray, Y, HV, test_size=0.1, random_state=SEED
 )
 from matplotlib.cm import get_cmap
 #X_train_rgb = np.repeat(X_train, 3, axis=-1)
 X_train_rgb = X_train
 # Load model
 from src.losses import bce_dice_loss,hover_loss_fixed
-checkpoint_path='models/checkpoints/neo/model_Gray.keras'
+checkpoint_path='models/checkpoints/neo/model_BB_RGB.keras'
 
 model = load_model(
     checkpoint_path,
@@ -120,7 +120,7 @@ seg_preds = preds['seg_head']
 hv_preds  = preds['hv_head']  # (batch, H, W, 2)
 #VISUAL CHECK
 
-for i in range(X_train.shape[0]):
+for i in range(5):
     isolated_count_blb, contour_img_blb, isolated_count_hv, contour_img_gt = nucle_counting(X_train, HV_train, Y_train, preds,i)
  
     seg = seg_preds[i]
@@ -131,6 +131,7 @@ for i in range(X_train.shape[0]):
     bg_prob = seg[..., 1]
     # mappa di probabilità nuclei
     prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+    
     print_results(X_train_rgb[i], prob_nucleus,contour_img_gt,prob_nucleus, hv_t[...,1],contour_img_blb,isolated_count_blb, isolated_count_hv)
 
 #CALC TOP TRESHOLD

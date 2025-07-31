@@ -9,7 +9,6 @@ import math
 from tensorflow import keras 
 from matplotlib.cm import get_cmap
 import tensorflow_io as tfio
-import segmentation_models as sm
 #from src.test_augm import build_instance_map_valuewise, GenInstanceHV
 import cv2
 
@@ -107,7 +106,7 @@ class DataGenerator(keras.utils.Sequence):
         self.shuffle = shuffle
         self.augment = augment
         self.skip_empty = skip_empty
-        self.preprocess_input = sm.get_preprocessing(BACKBONE)
+        self.preprocess_input = BACKBONE
         self.list_IDs = np.asarray(list_IDs)  # global indices
         self.ratio = 2
 
@@ -136,14 +135,16 @@ class DataGenerator(keras.utils.Sequence):
 
     def _make_target_3ch(self, m2):
         struct = np.ones((3, 3), dtype=bool)
+
         m2_ = 1-m2
         body_ = binary_erosion(m2_, structure=struct).astype(np.uint8)
         
         body = 1-body_
 
-        border = (m2 - body).clip(0, 1).astype(np.uint8)
+        border = (m2_ - body_).clip(0, 1).astype(np.uint8)
         background = (1 - m2).astype(np.uint8)
-        return np.stack([body, background, border], axis=-1)
+
+        return np.stack([body,background, border], axis=-1)
 
     def augm(self,
          seed: tuple[int,int],
@@ -283,10 +284,10 @@ class DataGenerator(keras.utils.Sequence):
             #img_rgb = cmap(blu_enhanced)[:, :, :3] 
 
             #GRAY SCALE
-            img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
-            img_gray = img_gray[..., np.newaxis]
-            img_rgb = np.repeat(img_gray, 3, axis=-1)
-            
+            #img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
+            #img_gray = img_gray[..., np.newaxis]
+            #img_rgb = np.repeat(img_gray, 3, axis=-1)
+            #
             mask = np.load(mask_path, mmap_mode='r')[local_idx]
         
             if mask.ndim == 3 and mask.shape[-1] == 1:
@@ -316,8 +317,9 @@ class DataGenerator(keras.utils.Sequence):
             HV[i] = hv
 
         return X, {'seg_head': Y, 'hv_head': HV}
-from tensorflow.keras.utils import register_keras_serializable
     
+from tensorflow.keras.utils import register_keras_serializable
+
 @register_keras_serializable()
 class CellDice(tf.keras.metrics.Metric):
     """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
@@ -326,9 +328,11 @@ class CellDice(tf.keras.metrics.Metric):
         self.smooth = smooth
         self.intersection = self.add_weight(name="inter", initializer="zeros")
         self.union        = self.add_weight(name="union", initializer="zeros")
+
     def _bin_mask(self, y):
         body, bg, border = tf.unstack(y, axis=-1)
         return tf.cast(body + border > bg, tf.float32)
+    
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true_b = self._bin_mask(y_true)           # bool
         y_pred_b = self._bin_mask(y_pred)
@@ -336,8 +340,10 @@ class CellDice(tf.keras.metrics.Metric):
         union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
         self.intersection.assign_add(inter)
         self.union.assign_add(union)
+        
     def result(self):
         return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
+    
     def reset_state(self):
         self.intersection.assign(0.0)
         self.union.assign(0.0)
@@ -389,7 +395,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/neo/model_Gray.keras'
+    checkpoint_path='models/checkpoints/neo/model_BB_RGB_v2.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -416,25 +422,27 @@ if __name__=="__main__":
 
     hv_batch = Yb['hv_head']
     #print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
-    
+    """"""
     for i in range(idx,idx + 4):
         fig, axs = plt.subplots(2, 2, figsize=(6,6))
         image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
         mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
         body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
         border_mask = mask_3ch[..., 2].astype(np.uint8)
+        background = mask_3ch[..., 1].astype(np.uint8)
 
         C = np.logical_or(body_mask, border_mask).astype(np.uint8)
         axs[0,0].imshow(Xb[i],cmap='gray')                         # immagine normalizzata [0,1]
-        axs[0,1].imshow(C,  vmin=0, vmax=1)  # body
-        axs[1,0].imshow(Yb['hv_head'][i, ..., 0])  # background
-        axs[1,1].imshow(Yb['hv_head'][i, ..., 1])  # border
+        axs[0,1].imshow(body_mask, cmap='gray')  # body
+        axs[1,0].imshow(background, cmap='gray')  # background
+        axs[1,1].imshow(border_mask, cmap='gray')  # border
     
         plt.tight_layout()
         plt.show()
-    
+    """
     model = get_model_paper()
-    model_ = model_paper_hover()
+    
+    #model_ = model_paper_hover()
     history = model.fit(train_gen,
             validation_data=val_gen, 
             epochs=60, 
@@ -444,8 +452,8 @@ if __name__=="__main__":
                 tensorboard_cb,
             ],
             verbose=1)
-
     """
+    
     #SECONDO ROUND
     
     from src.losses import bce_dice_loss,hover_loss_fixed
@@ -462,7 +470,7 @@ if __name__=="__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
     best = tf.keras.models.load_model(
-        "models/checkpoints/model_HE_HV.keras",
+        "models/checkpoints/neo/model_BB_RGB.keras",
         custom_objects={"CellDice": CellDice,
                         "bce_dice_loss": bce_dice_loss,
                         "hover_loss_fixed": hover_loss_fixed}
@@ -473,7 +481,7 @@ if __name__=="__main__":
         optimizer=optimizer,
         loss={'seg_head': bce_dice_loss,
               'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 1.0, 'hv_head': 0.05},
+        loss_weights={'seg_head': 0.25, 'hv_head': 5},
         metrics={'seg_head': [CellDice()], 'hv_head': []}
     )
 
@@ -483,7 +491,7 @@ if __name__=="__main__":
                        epochs=20,             # numero epoche aggiuntive
                        callbacks=[checkpoint_cb, earlystop_cb],
                        verbose=1)
-    """
+    
     """
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-4,
@@ -551,15 +559,163 @@ if __name__=="__main__":
                        epochs=20,             # numero epoche aggiuntive
                        callbacks=[checkpoint_cb, earlystop_cb],
                        verbose=1)
-    """
-    #OVERFITTING ?
-    hist = history.history           # dizionario {metric_name: [e1, e2, ...]}
+"""
+"""
+from src.losses import bce_dice_loss,hover_loss_fixed
+from tensorflow.keras.metrics import F1Score
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.layers import Conv2D, UpSampling2D, Concatenate, Input
+from tensorflow.keras.models import Model
 
-    plt.figure(figsize=(6, 4))
-    plt.plot(hist['loss'],     label='train loss')
-    plt.plot(hist['val_loss'], label='val loss')
-    plt.xlabel('Epoch'); plt.ylabel('Loss')
-    plt.title('Loss curves'); plt.legend(); plt.tight_layout()
-    plt.show()
+def build_unet_resnet34(input_shape=(256, 256, 3), freeze_encoder=True):
+    # Encoder: ResNet34 senza top
+    base_model = tf.keras.applications.ResNet50(
+        include_top=False,  # no classification head
+        weights='imagenet',
+        input_shape=input_shape
+    )
+    
+    if freeze_encoder:
+        for layer in base_model.layers:
+            layer.trainable = False
+
+    # Estraggo feature maps da diversi blocchi
+    skips = [
+        base_model.get_layer('conv1_relu').output,   # 128x128
+        base_model.get_layer('conv2_block3_out').output, # 64x64
+        base_model.get_layer('conv3_block4_out').output, # 32x32
+        base_model.get_layer('conv4_block6_out').output  # 16x16
+    ]
+    x = base_model.get_layer('conv5_block3_out').output  # 8x8
+
+    # Decoder: upsampling + concatenazione con skip connection
+    for skip in reversed(skips):
+        x = UpSampling2D()(x)
+        x = Concatenate()([x, skip])
+        x = Conv2D(256, 3, padding='same', activation='relu')(x)
+        x = Conv2D(256, 3, padding='same', activation='relu')(x)
+
+    # Output finale decoder: 256x256
+    x = UpSampling2D()(x)
+
+    return base_model.input, x
+
+inputs, decoder_output = build_unet_resnet34(input_shape=(256,256,3), freeze_encoder=True)
+tf.config.run_functions_eagerly(True)
+# Head segmentazione
+seg_head = Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
+seg_head = Conv2D(3, (1, 1), activation='softmax', name='seg_head')(seg_head)
+
+# Head HoVer (regressione)
+hv_head = Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
+hv_head = Conv2D(2, (1, 1), activation='linear', name='hv_head')(hv_head)
+
+# Modello finale
+model = Model(inputs=inputs, outputs={'seg_head': seg_head, 'hv_head': hv_head})
+
+lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=1e-3,
+        first_decay_steps=25,   # 10 epoche
+        t_mul=2.0,                                # lunghezza fase raddoppia
+        m_mul=0.8,                                # ampiezza si riduce
+        alpha=1e-5 / 1e-3                         # min_lr
+    )
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+metric = F1Score(threshold=0.5)
+model.compile(
+    optimizer=optimizer,
+    loss={
+        'seg_head': bce_dice_loss,
+        'hv_head': hover_loss_fixed
+    },
+    loss_weights={
+        'seg_head': 1.0,
+        'hv_head': 1.5
+    },
+    metrics={'seg_head': [CellDice()],
+             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
+)
+model.fit(train_gen,
+          validation_data=val_gen,
+          epochs=1,
+          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+          verbose=1)
+
+# Recupera una batch
+X_batch, y_batch = next(iter(val_gen))
+y_pred = model.predict(X_batch, verbose=0)['seg_head']
+
+# Applica la logica _bin_mask a mano (argmax-based)
+labels_true = tf.argmax(y_batch['seg_head'], axis=-1)
+labels_pred = tf.argmax(y_pred, axis=-1)
+
+cell_true = tf.cast((labels_true == 0) | (labels_true == 2), tf.float32)
+cell_pred = tf.cast((labels_pred == 0) | (labels_pred == 2), tf.float32)
+
+intersection = tf.reduce_sum(cell_true * cell_pred)
+union = tf.reduce_sum(cell_true) + tf.reduce_sum(cell_pred)
+print("cell_true mean:", tf.reduce_mean(cell_true).numpy())
+print("cell_pred mean:", tf.reduce_mean(cell_pred).numpy())
+dice = (2 * intersection) / (union + 1e-6)
+print(f"Manual CellDice (batch): {dice.numpy():.4f}")
+
+
+i = 0  # indice della prima immagine nella batch
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 3, 1)
+plt.imshow(cell_true[i], cmap='gray')
+plt.title("GT (body ∪ border)")
+
+plt.subplot(1, 3, 2)
+plt.imshow(cell_pred[i], cmap='gray')
+plt.title("Pred (body ∪ border)")
+
+plt.subplot(2, 3, 1)
+plt.imshow(cell_true[i] * cell_pred[i], cmap='gray')
+plt.title("Intersection")
+
+plt.subplot(2, 3, 2)
+plt.imshow(labels_pred[i], cmap='nipy_spectral')
+plt.title("Intersection")
+
+plt.tight_layout()
+plt.show()
+
+# Sblocco encoder
+for layer in model.layers:
+    layer.trainable = True
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+model.compile(
+    optimizer=optimizer,
+    loss={
+        'seg_head': bce_dice_loss,
+        'hv_head': hover_loss_fixed
+    },
+    loss_weights={
+        'seg_head': 1.0,
+        'hv_head': 1.5
+    },
+    metrics={'seg_head': [CellDice()],
+             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
+)
+# Allenamento completo
+history = model.fit(train_gen,
+          validation_data=val_gen,
+          epochs=50,
+          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+          verbose=1)
+"""
+#OVERFITTING ?
+hist = history.history           # dizionario {metric_name: [e1, e2, ...]}
+plt.figure(figsize=(6, 4))
+plt.plot(hist['loss'],     label='train loss')
+plt.plot(hist['val_loss'], label='val loss')
+plt.xlabel('Epoch'); plt.ylabel('Loss')
+plt.title('Loss curves'); plt.legend(); plt.tight_layout()
+plt.show()
     
     

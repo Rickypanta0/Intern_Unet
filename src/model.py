@@ -19,6 +19,7 @@ class CellDice(tf.keras.metrics.Metric):
     def _bin_mask(self, y):
         body, bg, border = tf.unstack(y, axis=-1)
         return tf.cast(body + border > bg, tf.float32)
+    
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true_b = self._bin_mask(y_true)           # bool
         y_pred_b = self._bin_mask(y_pred)
@@ -26,8 +27,10 @@ class CellDice(tf.keras.metrics.Metric):
         union = tf.reduce_sum(y_true_b) + tf.reduce_sum(y_pred_b)
         self.intersection.assign_add(inter)
         self.union.assign_add(union)
+
     def result(self):
         return (2.0 * self.intersection + self.smooth) / (self.union + self.smooth)
+    
     def reset_state(self):
         self.intersection.assign(0.0)
         self.union.assign(0.0)
@@ -265,7 +268,7 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 1.0
+        'hv_head': 2.0
     },
     metrics={'seg_head': [CellDice()],
              'hv_head' : [tf.keras.metrics.MeanSquaredError()]}

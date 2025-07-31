@@ -8,7 +8,7 @@ import tensorflow as tf
 from skimage.color import rgb2hed, hed2rgb
 from tqdm import tqdm
 from matplotlib.cm import get_cmap
-from src.utils.metrics import dice_loss
+from src.utils.metrics import get_fast_dice_2, get_fast_aji,get_fast_pq
 import pandas as pd
 import gc
 from keras import backend as K
@@ -42,47 +42,61 @@ def loadmodel(checkpoint_path, weight_seg_head=1.0, weight_hv_head=1.0):
     return model
 from torchmetrics.classification import JaccardIndex
 import torch
-from torcheval.metrics.functional import binary_f1_score
 
-def score_testSet(preds, Y):
+def score_testSet(preds, Y, HV):
     H = 256
     W = 256
     f1_list = []
     dice_list = []
     iou_list = []
     seg_preds = preds['seg_head']
+    hv_preds  = preds['hv_head']
     jaccard = JaccardIndex(task='binary')
     for i in range(Y.shape[0]):
         seg = seg_preds[i]
+        hv = hv_preds[i]
+        hv_t = HV[i]
         body_prob = seg[..., 0]
         border_prob = seg[..., 2]
         bg_prob = seg[..., 1]
-        y_pred_bin = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
-        y_true_bin = Y[i]
-        """"""
-        plt.subplot(1,3,1); plt.imshow(Y[i], cmap='gray'); plt.title("GT")
-        plt.subplot(1,3,2); plt.imshow(y_pred_bin.reshape(Y[i].shape), cmap='gray'); plt.title("Pred")
-        plt.subplot(1,3,3); plt.imshow((Y[i].squeeze() == y_pred_bin).astype(int), cmap='gray'); plt.title("Match")
-        plt.show()
+        #plt.subplot(1,3,1); plt.imshow(body_prob, cmap='gray'); plt.title("body")
+        #plt.subplot(1,3,2); plt.imshow(border_prob, cmap='gray'); plt.title("border")
+        #plt.subplot(1,3,3); plt.imshow(bg_prob, cmap='gray'); plt.title("background")
+        #plt.show()
+        y_pred_bin = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.int32)
+        y_true_bin = Y[i].astype(np.int32)
+
+        #plt.subplot(1,3,1); plt.imshow(Y[i], cmap='gray'); plt.title("GT")
+        #plt.subplot(1,3,2); plt.imshow(y_pred_bin.reshape(Y[i].shape), cmap='gray'); plt.title("Pred")
+        #plt.subplot(1,3,3); plt.imshow((Y[i].squeeze() == y_pred_bin).astype(int), cmap='gray'); plt.title("Match")
+        #plt.show()
         
+        pred = 1 - y_pred_bin
+        gt = 1 - y_true_bin
+
         y_pred_flat = y_pred_bin.flatten()
         y_true_flat = y_true_bin.flatten()
 
+        iou = (pred & gt).sum() / (pred | gt).sum()
+        #print(f"IOU: {iou}")
+
         if y_true_flat.sum() == 0 and y_pred_flat.sum() == 0:
             continue
-        pred_tensor = torch.tensor(y_pred_flat, dtype=torch.long)
-        true_tensor = torch.tensor(y_true_flat, dtype=torch.long)
 
-        pred_tensor_ = torch.tensor(y_pred_bin.reshape(1, 1, H, W), dtype=torch.float32)
-        true_tensor_ = torch.tensor(y_true_bin.reshape(1, 1, H, W), dtype=torch.float32)
+        pred = np.stack([y_pred_bin, hv[..., 0], hv[..., 1]], axis=-1)
+        label_pred = __proc_np_hv(pred,trhld=0.55)
 
-        iou_val = jaccard(pred_tensor, true_tensor).item()
-        f1_val = binary_f1_score(pred_tensor, true_tensor).item()
-        dice_val = 1 - dice_loss(pred_tensor_, true_tensor_).item()
+        pred_GT = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+        label_true = __proc_np_hv(pred_GT, GT=True)
 
-        #print(f"IoU[{i}]: {iou_val:.4f}, F1[{i}]: {f1_val:.4f}, Dice: {dice_val:.4f}")
+        iou_val = get_fast_aji(label_true, label_pred)
+        outcome,_ = get_fast_pq(label_true, label_pred)
+        f1, sq, pq = outcome
 
-        f1_list.append(f1_val)
+        dice_val = get_fast_dice_2(label_true, label_pred)
+        #print(f"IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
+
+        f1_list.append(f1)
         iou_list.append(iou_val)
         dice_list.append(dice_val)
 
@@ -114,65 +128,61 @@ def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     print(df)
     return styled
 
-def labels_scores(checkpoint_paths, X_orig, Y):
+def pre_proces(checkpoint, X_orig, weight_hv_head=1.0):
+    X = np.array(X_orig, copy=True)
+    if 'RGB' in checkpoint:
+        X = np.clip(X + 15, 0, 255)
+        X = X / 255.0
+    elif 'HE' in checkpoint:
+        X = X / 255.0
+        X_ = []
+        for f in X:
+            ihc_h, _, _ = HE_deconv(f)
+            X_.append(ihc_h)
+        X = np.stack(X_, axis=0)
+    elif 'Blu' in checkpoint:
+        X = X / 255.0
+        X_ = []
+        cmap = get_cmap('Blues')
+        for f in X:
+            blu = f[..., 2]
+            blu_enhanced = np.clip(blu + 0.05, 0, 1)
+            img_rgb = cmap(blu_enhanced)[..., :3]
+            X_.append(img_rgb)
+        X = np.stack(X_, axis=0)
+    elif 'Gray' in checkpoint:
+        X = X + 15
+        X = X / 255
+        X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
+        X = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
+    else:
+        raise ValueError(f"Checkpoint non riconosciuto: {checkpoint}")
+    
+    model = loadmodel(checkpoint_path=checkpoint_paths[i], weight_hv_head=weight_hv_head)
+    preds = model.predict(X)
+    return preds, X
+
+def labels_scores(checkpoint, Y, HV):
     f1_score = []
     dice_score = []
     iou_score = []
-    for i, checkpoint in enumerate(checkpoint_paths):
-        X = np.array(X_orig, copy=True)
-        if 'RGB' in checkpoint:
-            X = np.clip(X + 15, 0, 255)
-            X = X / 255.0
 
-        elif 'HE' in checkpoint:
-            X = X / 255.0
-            X_ = []
-            for f in X:
-                ihc_h, _, _ = HE_deconv(f)
-                X_.append(ihc_h)
-            X = np.stack(X_, axis=0)
-
-        elif 'Blu' in checkpoint:
-            X = X / 255.0
-            X_ = []
-            cmap = get_cmap('Blues')
-            for f in X:
-                blu = f[..., 2]
-                blu_enhanced = np.clip(blu + 0.05, 0, 1)
-                img_rgb = cmap(blu_enhanced)[..., :3]
-                X_.append(img_rgb)
-            X = np.stack(X_, axis=0)
-        elif 'Gray' in checkpoint:
-            X = X + 15
-            X = X / 255
-            X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
-            X = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
-        else:
-            raise ValueError(f"Checkpoint non riconosciuto: {checkpoint}")
-
-        model = loadmodel(checkpoint_path=checkpoint_paths[i], weight_hv_head=1.0)
-        preds = model.predict(X)
-
-        f1, dice, iou = score_testSet(preds, Y)
-        
-        f1_score.append(f1)
-        dice_score.append(dice)
-        iou_score.append(iou)
+    f1, dice, iou = score_testSet(preds, Y, HV)
     
-        del model, preds, X
-        K.clear_session()
-        tf.keras.backend.clear_session()
-        gc.collect()
+    f1_score.append(f1)
+    dice_score.append(dice)
+    iou_score.append(iou)
 
-        print("checkpoint: ", checkpoint)
-        print("F1:", f1)
-        print("Dice:", dice)
-        print("IoU:", iou)
+    print("checkpoint: ", checkpoint)
+    print("F1:", f1)
+    print("Dice:", dice)
+    print("IoU:", iou)
     #print_labels(f1_score,dice_score,iou_score)
 
 
 from src.postprocessing import __proc_np_hv
 from scipy.stats import pearsonr
+from sklearn.metrics import r2_score
 def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds):
     N_gt = []
     N_pred = []
@@ -213,8 +223,9 @@ def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds):
 
     # 3. Correlazione e MAE
     r, _ = pearsonr(N_gt, N_pred)
+    r2 = r2_score(N_gt, N_pred) #https://arxiv.org/pdf/2409.04175#page=1.98 [69]
     mae  = np.mean(np.abs(N_gt - N_pred))
-    plt.title(f'ρ = {r:.3f}, MAE = {mae:.1f}')
+    plt.title(f'ρ = {r:.3f}, MAE = {mae:.1f}, R2 = {r2}')
     plt.tight_layout(); plt.show()
     
     return N_gt, N_pred
@@ -309,57 +320,28 @@ Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
-X = X + 15
-X = X / 255
+
 k = min(4, X.shape[0])                                 # quante immagini mostrare
 high = max(1, X.shape[0] - (k - 5))                    # ultimo indice di partenza valido + 1
 idx = np.random.randint(0, high)  
 
 
-
-#for i in range(idx,idx+5):
-#    ihc_h, _, _ = HE_deconv(X[i])
-#    
-#    blu = X[i,...,2]
-#    cmap = get_cmap('Blues')
-#    channel3_rgb = cmap(blu)[:, :, :3] 
-#    
-#    fig, axs = plt.subplots(1,3,figsize=(8,8))
-#    axs[0].imshow(X[i])
-#    axs[1].imshow(channel3_rgb)
-#    axs[2].imshow(channel3_rgb)
-#    plt.tight_layout()
-#    plt.show()
-#X_ = []
-#for f in X:
-#    ihc_h, _, _ = HE_deconv(f)
-#    X_.append(ihc_h)
-#X_ = np.stack(X_, axis=0)
-#
-#
-#X_ = []
-#for f in X:
-#    blu = f[...,2]
-#    blu_enhanced = np.clip(blu + 0.05, 0, 1)
-#    cmap = get_cmap('Blues')
-#    img_rgb = cmap(blu_enhanced)[:, :, :3] 
-#    X_.append(img_rgb)
-#X_ = np.stack(X_,axis=0)
-#
-X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
-X_ = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
 checkpoint_Blu='models/checkpoints/neo/model_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
 checkpoint_paths=[checkpoint_RGB]
 #
-model = loadmodel(checkpoint_path='models/checkpoints/neo/model_Gray.keras', weight_hv_head=1.0)
-preds = model.predict(X_)
-N_gt, N_pred_rgb = grafo_diffusione(X_,Y,HV,preds)
+#model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
+#preds = model.predict(X_)
+preds, X = pre_proces(checkpoint_RGB, X)
+#N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds)
 #
-#labels_scores(checkpoint_paths, X, Y)
+f1, dice, iou = score_testSet(preds, Y, HV)
+
+print(f"checkpoint: {checkpoint_RGB}\n")
+print(f"F1: {f1}, Dice: {dice}, IoU: {iou}")
 
 scores_F1 = [0.9647045533373284, 0.9624335286067217, 0.9472365862827455, 0.959334461216888]
 scores_Dice = [0.9647049096294574, 0.962433908088167, 0.9472371079219255, 0.9593348696247608]
@@ -368,7 +350,7 @@ scores_IoU = [0.9331706415897428, 0.9290504189732318, 0.9020675153832152, 0.9233
 # Mostra tabella
 #print_labels_with_plot(scores_F1, scores_Dice, scores_IoU)   
 
-res_bias = test_count_bias(N_gt, N_pred_rgb)
+#res_bias = test_count_bias(N_gt, N_pred_rgb)
 
 def plot_bias_histogram(N_gt, N_pred, res, bins=30, title="Bias di conteggio"):
     diff = np.asarray(N_pred, float) - np.asarray(N_gt, float)
@@ -390,5 +372,5 @@ def plot_bias_histogram(N_gt, N_pred, res, bins=30, title="Bias di conteggio"):
     plt.grid(alpha=0.2)
     plt.show()
 
-plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello Blu")
-print(res_bias)
+#plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello Blu")
+#print(res_bias)

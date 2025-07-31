@@ -86,10 +86,10 @@ def __proc_np_hv(pred, GT=False, trhld=0.55):
     """
     pred = np.array(pred, dtype=np.float32)
 
-    blb_raw = pred[..., 0]
+    blb_raw =  1 - pred[...,0]
     h_dir_raw = pred[..., 1]
     v_dir_raw = pred[..., 2]
-
+    
     # processing
     blb = np.array(blb_raw >= 0.5, dtype=np.int32)
 
@@ -229,6 +229,7 @@ def nucle_counting(X_train, HV_train, Y_train, preds, i):
     bg_prob = seg[..., 1]
     # mappa di probabilità nuclei
     prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+    
     pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
     # segmentazione con watershed guidata da HV map
     label_map = __proc_np_hv(pred)
