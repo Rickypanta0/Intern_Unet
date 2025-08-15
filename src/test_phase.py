@@ -12,7 +12,37 @@ from src.utils.metrics import get_fast_dice_2, get_fast_aji,get_fast_pq
 import pandas as pd
 import gc
 from keras import backend as K
+class DiceScore(tf.keras.metrics.Metric):
+    """
+    Dice coefficient (a.k.a. F1 per segmentazione binaria).
+    Se y_pred è una mappa di probabilità applica la soglia desiderata,
+    altrimenti accetta già tensori {0,1}.
+    """
+    def __init__(self, threshold=0.5, name="dice", dtype=None, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
+        self.threshold = threshold
+        self.intersection = self.add_weight(name="intersection", initializer="zeros")
+        self.union        = self.add_weight(name="union",        initializer="zeros")
 
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # Cast a float32 (evita overflow con somma su batch grandi)
+        y_true = tf.cast(y_true, self.dtype)
+        y_pred = tf.cast(y_pred > self.threshold, self.dtype)   # binarizza
+
+        inter = tf.reduce_sum(y_true * y_pred)
+        union = tf.reduce_sum(y_true) + tf.reduce_sum(y_pred)
+
+        self.intersection.assign_add(inter)
+        self.union.assign_add(union)
+
+    def result(self):
+        smooth = tf.constant(1e-6, dtype=self.dtype)
+        return (2.0 * self.intersection + smooth) / (self.union + smooth)
+
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
+    
 def HE_deconv(img):
     ihc_hed = rgb2hed(img)
 
@@ -43,16 +73,20 @@ def loadmodel(checkpoint_path, weight_seg_head=1.0, weight_hv_head=1.0):
 from torchmetrics.classification import JaccardIndex
 import torch
 
-def score_testSet(preds, Y, HV):
+from tensorflow.keras.metrics import F1Score, IoU
+def score_testSet(preds, Y, HV, X):
     H = 256
     W = 256
-    f1_list = []
-    dice_list = []
-    iou_list = []
+    I_f1_list = []
+    I_dice_list = []
+    I_iou_list = []
     seg_preds = preds['seg_head']
     hv_preds  = preds['hv_head']
-    jaccard = JaccardIndex(task='binary')
-    for i in range(Y.shape[0]):
+
+    f1_metric = F1Score(average='macro',threshold=0.5, name='f1')
+    iou_metric = IoU(num_classes=2, target_class_ids=[1], name='iou')
+    
+    for i in tqdm(range(Y.shape[0])):
         seg = seg_preds[i]
         hv = hv_preds[i]
         hv_t = HV[i]
@@ -70,40 +104,40 @@ def score_testSet(preds, Y, HV):
         #plt.subplot(1,3,2); plt.imshow(y_pred_bin.reshape(Y[i].shape), cmap='gray'); plt.title("Pred")
         #plt.subplot(1,3,3); plt.imshow((Y[i].squeeze() == y_pred_bin).astype(int), cmap='gray'); plt.title("Match")
         #plt.show()
-        
-        pred = 1 - y_pred_bin
-        gt = 1 - y_true_bin
 
-        y_pred_flat = y_pred_bin.flatten()
-        y_true_flat = y_true_bin.flatten()
+        iou_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
+        f1_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
 
-        iou = (pred & gt).sum() / (pred | gt).sum()
-        #print(f"IOU: {iou}")
-
-        if y_true_flat.sum() == 0 and y_pred_flat.sum() == 0:
+        if y_true_bin.sum() == 0 and y_pred_bin.sum() == 0:
+            print("NNNNN")
             continue
 
         pred = np.stack([y_pred_bin, hv[..., 0], hv[..., 1]], axis=-1)
-        label_pred = __proc_np_hv(pred,trhld=0.55)
+        label_pred = __proc_np_hv(pred,trhld=0.43)
 
         pred_GT = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
         label_true = __proc_np_hv(pred_GT, GT=True)
-
-        iou_val = get_fast_aji(label_true, label_pred)
+ 
+        #print(np.unique(label_pred), np.unique(label_true))
+        
+        iou_val = get_fast_aji(label_true, label_pred, pred_GT, pred, seg, X[i])
         outcome,_ = get_fast_pq(label_true, label_pred)
         f1, sq, pq = outcome
-
         dice_val = get_fast_dice_2(label_true, label_pred)
-        #print(f"IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
+        #print(f"ISTANCE: IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
 
-        f1_list.append(f1)
-        iou_list.append(iou_val)
-        dice_list.append(dice_val)
+        I_f1_list.append(f1)
+        I_iou_list.append(iou_val)
+        I_dice_list.append(dice_val)
 
-    f1 = np.mean(f1_list)
-    dice = np.mean(dice_list)
-    iou = np.mean(iou_list)
-    return f1, dice, iou
+    f1r = np.mean(I_f1_list)
+    dicer = np.mean(I_dice_list)
+    iour = np.mean(I_iou_list)
+
+    iou = float(iou_metric.result())
+    f1 = float(f1_metric.result())
+    
+    return [f1r, dicer, iour], [iou,f1]
 
 def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     # Crea DataFrame
@@ -128,16 +162,24 @@ def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     print(df)
     return styled
 
-def pre_proces(checkpoint, X_orig, weight_hv_head=1.0):
-    X = np.array(X_orig, copy=True)
+def hema_rgb( img_rgb01):  # img in [0,1]
+        ihc = rgb2hed(np.clip(img_rgb01, 0, 1))
+        H = ihc[..., 0]
+        hema_only = np.stack([H, np.zeros_like(H), np.zeros_like(H)], axis=-1)
+        img_h = hed2rgb(hema_only).astype(np.float32)  # torna in RGB
+        return np.clip(img_h, 0, 1) 
+
+def pre_proces(checkpoint, X, weight_hv_head=1.0):
     if 'RGB' in checkpoint:
         X = np.clip(X + 15, 0, 255)
         X = X / 255.0
     elif 'HE' in checkpoint:
         X = X / 255.0
         X_ = []
+        print("RRRR")
         for f in X:
-            ihc_h, _, _ = HE_deconv(f)
+            ihc_h = hema_rgb(f)
+            #ihc_h, _, _ = HE_deconv(f)
             X_.append(ihc_h)
         X = np.stack(X_, axis=0)
     elif 'Blu' in checkpoint:
@@ -158,7 +200,7 @@ def pre_proces(checkpoint, X_orig, weight_hv_head=1.0):
     else:
         raise ValueError(f"Checkpoint non riconosciuto: {checkpoint}")
     
-    model = loadmodel(checkpoint_path=checkpoint_paths[i], weight_hv_head=weight_hv_head)
+    model = loadmodel(checkpoint_path=checkpoint, weight_hv_head=weight_hv_head)
     preds = model.predict(X)
     return preds, X
 
@@ -203,7 +245,7 @@ def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds):
         hv = hv_preds[i]
         pred = np.stack([mask_pred, hv[..., 0], hv[..., 1]], axis=-1)
         # segmentazione con watershed guidata da HV map
-        label_pred = __proc_np_hv(pred,trhld=0.55)
+        label_pred = __proc_np_hv(pred,trhld=0.43)
 
         #determinazione labels GT
         hv_t = test_set_hv[i]
@@ -310,7 +352,7 @@ for i, (img_path, mask_path, dist_path) in enumerate(folds):
     masks = np.load(mask_path, mmap_mode='r')
     dmaps = np.load(dist_path, mmap_mode='r')
 
-    #idxs = rng.choice(len(imgs), size=N, replace=False)
+    idxs = rng.choice(len(imgs), size=N, replace=False)
     imgs_list.append(imgs)
     masks_list.append(masks)
     dmaps_list.append(dmaps)
@@ -326,9 +368,9 @@ high = max(1, X.shape[0] - (k - 5))                    # ultimo indice di parten
 idx = np.random.randint(0, high)  
 
 
-checkpoint_Blu='models/checkpoints/neo/model_Blu.keras'
+checkpoint_Blu='models/checkpoints/neo/model_BB_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
 checkpoint_paths=[checkpoint_RGB]
@@ -336,16 +378,58 @@ checkpoint_paths=[checkpoint_RGB]
 #model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
 preds, X = pre_proces(checkpoint_RGB, X)
+k = min(4, X.shape[0])                                 # quante immagini mostrare
+high = max(1, X.shape[0] - (k - 1))                    # ultimo indice di partenza valido + 1
+idx = np.random.randint(0, high)    
+
+#print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
+""""""
+from matplotlib.colors import hsv_to_rgb
+for i in range(idx,idx + 4):
+    fig, axs = plt.subplots(2, 3, figsize=(6,6))
+    image = X[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+    mask_3ch = Y[i]       # (H, W, 3) – bodycell, background, bordercell
+    hv = HV[i]
+    mask_3chp = preds['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
+    hvp = preds['hv_head'][i]
+    clip_pct=99
+    hx = hvp[..., 0]
+    hy = hvp[..., 1]
+    ang = np.arctan2(hy, hx)                 # [-pi, pi]
+    hue = (ang + np.pi) / (2*np.pi)          # [0,1] -> direzione
+
+    mag = np.sqrt(hx*hx + hy*hy)
+    mmax = np.percentile(mag, clip_pct) + 1e-8
+    val = np.clip(mag / mmax, 0, 1)          # [0,1] -> intensità
+
+    sat = np.ones_like(val)                  # saturazione piena
+    hsv = np.stack([hue, sat, val], axis=-1)
+    rgb = hsv_to_rgb(hsv).astype(np.float32)
+    body, bg, border = tf.unstack(mask_3chp, axis=-1)
+    Cp = tf.cast(body + border > bg, tf.float32)
+    axs[0,0].imshow(X[i])                         # immagine normalizzata [0,1]
+    axs[0,1].imshow(Cp, cmap='gray')  # body
+    axs[0,2].imshow(hx)  # background
+    axs[1,0].imshow(mask_3ch, cmap='gray')  # border
+    axs[1,1].imshow(hv[...,0])  # body
+    axs[1,2].imshow(hv[...,1])  # background
+
+    plt.tight_layout()
+    plt.show()
 #N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds)
-#
-f1, dice, iou = score_testSet(preds, Y, HV)
 
+v, v_ = score_testSet(preds, Y, HV, X)
+print(v,v_)
 print(f"checkpoint: {checkpoint_RGB}\n")
-print(f"F1: {f1}, Dice: {dice}, IoU: {iou}")
+print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
+#RGB, HE, Blu, Gray Label
+L_scores_F1 = [0.6494954673267342, 0.9624335286067217, 0.9472365862827455, 0.959334461216888]
+L_scores_Dice = [0.6938941265614244, 0.962433908088167, 0.9472371079219255, 0.9593348696247608]
+L_scores_IoU = [0.5750426737055911, 0.9290504189732318, 0.9020675153832152, 0.923387367286549]
 
-scores_F1 = [0.9647045533373284, 0.9624335286067217, 0.9472365862827455, 0.959334461216888]
-scores_Dice = [0.9647049096294574, 0.962433908088167, 0.9472371079219255, 0.9593348696247608]
-scores_IoU = [0.9331706415897428, 0.9290504189732318, 0.9020675153832152, 0.923387367286549]
+#RGB, HE, Blu BinaryMask
+scores_F1 = [0.8431848287582397]
+scores_IoU = [0.7296468019485474]
 
 # Mostra tabella
 #print_labels_with_plot(scores_F1, scores_Dice, scores_IoU)   

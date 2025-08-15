@@ -74,7 +74,7 @@ def remove_small_objects(pred, min_size=64, connectivity=1):
 
     return out
 
-def __proc_np_hv(pred, GT=False, trhld=0.55):
+def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     """Process Nuclei Prediction with XY Coordinate Map.
 
     Args:
@@ -86,7 +86,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55):
     """
     pred = np.array(pred, dtype=np.float32)
 
-    blb_raw =  1 - pred[...,0]
+    blb_raw =  1-pred[...,0]
     h_dir_raw = pred[..., 1]
     v_dir_raw = pred[..., 2]
     
@@ -94,7 +94,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55):
     blb = np.array(blb_raw >= 0.5, dtype=np.int32)
 
     blb = measurements.label(blb)[0]
-    blb = remove_small_objects(blb, min_size=10)
+    blb = remove_small_objects(blb, min_size=min_area)
     blb[blb > 0] = 1  # background is 0 already
 
     h_dir = cv2.normalize(
@@ -123,8 +123,8 @@ def __proc_np_hv(pred, GT=False, trhld=0.55):
     overall[blb>0] = 3
     #plt.imshow(overall)
     #plt.show()
-    treshold = 0.45 if GT else trhld
-    boundary_mask = overall > treshold  # es. 0.4
+
+    boundary_mask = overall > trhld  # es. 0.4
     kernel = np.ones((3,3),np.uint8)
     boundary_mask = boundary_mask.astype(np.uint8)
     boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2) if not GT else boundary_mask
@@ -232,7 +232,9 @@ def nucle_counting(X_train, HV_train, Y_train, preds, i):
     
     pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
     # segmentazione con watershed guidata da HV map
-    label_map = __proc_np_hv(pred)
+    label_map = __proc_np_hv(pred,trhld=0.55)
+    #plt.imshow(hv[..., 0], cmap='jet')
+    #plt.show()
     print(Y_train[i].shape, hv_t[..., 0].shape)
     pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
     label_map_GT = __proc_np_hv(pred_GT, GT=True)

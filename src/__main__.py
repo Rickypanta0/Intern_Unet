@@ -11,6 +11,7 @@ from matplotlib.cm import get_cmap
 import tensorflow_io as tfio
 #from src.test_augm import build_instance_map_valuewise, GenInstanceHV
 import cv2
+from skimage.exposure import rescale_intensity
 
 BACKBONE = 'resnet34'
 
@@ -233,6 +234,13 @@ class DataGenerator(keras.utils.Sequence):
         
         return xz_np, yz_np, hv_np_f
 
+    def hema_rgb(self, img_rgb01):  # img in [0,1]
+        ihc = rgb2hed(np.clip(img_rgb01, 0, 1))
+        H = ihc[..., 0]
+        hema_only = np.stack([H, np.zeros_like(H), np.zeros_like(H)], axis=-1)
+        img_h = hed2rgb(hema_only).astype(np.float32)  # torna in RGB
+        return np.clip(img_h, 0, 1) 
+
     def __data_generation(self, list_temp):
         if self.patch_size is None:
             H, W, _ = self.default_shape
@@ -266,7 +274,7 @@ class DataGenerator(keras.utils.Sequence):
             img_path, mask_path, hv_path = self.folds[fold_idx]
 
             img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img + 15) / 255.0
+            img_rgb = (img + 10) / 255.0
             
             #HESOINE EXTRACTION
             
@@ -275,7 +283,7 @@ class DataGenerator(keras.utils.Sequence):
             ## Create an RGB image for each of the stains
             #null = np.zeros_like(ihc_hed[:, :, 0])
             #img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
-            
+            #img_rgb = self.hema_rgb(img_rgb)
             #BLU CHANNEL
             
             #blu = img_rgb[...,2]
@@ -302,15 +310,21 @@ class DataGenerator(keras.utils.Sequence):
                     img_rgb = np.fliplr(img_rgb)
                     mask   = np.fliplr(mask)
                     hv      = np.fliplr(hv)
+                    hv[...,0] *= -1  # inverti x
                 if np.random.rand() < 0.5:
                     img_rgb = np.flipud(img_rgb)
                     mask   = np.flipud(mask)
                     hv      = np.flipud(hv)
+                    hv[...,1] *= -1  # inverti y
                 k = np.random.randint(4) 
                 #print(mask.shape)
                 img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
                 mask   = np.rot90(mask,   k, axes=(0, 1))
                 hv      = np.rot90(hv,      k, axes=(0, 1))
+
+                if   k == 1: hv = np.stack([-hv[...,1],  hv[...,0]], axis=-1)
+                elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
+                elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
 
             X[i] = img_rgb
             Y[i] = mask
@@ -395,7 +409,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/neo/model_BB_RGB_v2.keras'
+    checkpoint_path='models/checkpoints/neo/model_RGB1.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -424,18 +438,21 @@ if __name__=="__main__":
     #print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
     """"""
     for i in range(idx,idx + 4):
-        fig, axs = plt.subplots(2, 2, figsize=(6,6))
+        fig, axs = plt.subplots(2, 3, figsize=(6,6))
         image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
         mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
+        hv = Yb['hv_head'][i]
         body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
         border_mask = mask_3ch[..., 2].astype(np.uint8)
         background = mask_3ch[..., 1].astype(np.uint8)
 
         C = np.logical_or(body_mask, border_mask).astype(np.uint8)
-        axs[0,0].imshow(Xb[i],cmap='gray')                         # immagine normalizzata [0,1]
+        axs[0,0].imshow(Xb[i])                         # immagine normalizzata [0,1]
         axs[0,1].imshow(body_mask, cmap='gray')  # body
-        axs[1,0].imshow(background, cmap='gray')  # background
-        axs[1,1].imshow(border_mask, cmap='gray')  # border
+        axs[0,2].imshow(background, cmap='gray')  # background
+        axs[1,0].imshow(border_mask, cmap='gray')  # border
+        axs[1,1].imshow(hv[...,0])  # body
+        axs[1,2].imshow(hv[...,1])  # background
     
         plt.tight_layout()
         plt.show()
@@ -470,7 +487,7 @@ if __name__=="__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
     best = tf.keras.models.load_model(
-        "models/checkpoints/neo/model_BB_RGB.keras",
+        "models/checkpoints/neo/model_RGB.keras",
         custom_objects={"CellDice": CellDice,
                         "bce_dice_loss": bce_dice_loss,
                         "hover_loss_fixed": hover_loss_fixed}
@@ -622,7 +639,6 @@ lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
     )
 optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
-metric = F1Score(threshold=0.5)
 model.compile(
     optimizer=optimizer,
     loss={
@@ -631,63 +647,22 @@ model.compile(
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 1.5
+        'hv_head': 2.0
     },
     metrics={'seg_head': [CellDice()],
              'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
 )
 model.fit(train_gen,
           validation_data=val_gen,
-          epochs=1,
-          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
+          epochs=50,
+          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
           verbose=1)
-
-# Recupera una batch
-X_batch, y_batch = next(iter(val_gen))
-y_pred = model.predict(X_batch, verbose=0)['seg_head']
-
-# Applica la logica _bin_mask a mano (argmax-based)
-labels_true = tf.argmax(y_batch['seg_head'], axis=-1)
-labels_pred = tf.argmax(y_pred, axis=-1)
-
-cell_true = tf.cast((labels_true == 0) | (labels_true == 2), tf.float32)
-cell_pred = tf.cast((labels_pred == 0) | (labels_pred == 2), tf.float32)
-
-intersection = tf.reduce_sum(cell_true * cell_pred)
-union = tf.reduce_sum(cell_true) + tf.reduce_sum(cell_pred)
-print("cell_true mean:", tf.reduce_mean(cell_true).numpy())
-print("cell_pred mean:", tf.reduce_mean(cell_pred).numpy())
-dice = (2 * intersection) / (union + 1e-6)
-print(f"Manual CellDice (batch): {dice.numpy():.4f}")
-
-
-i = 0  # indice della prima immagine nella batch
-plt.figure(figsize=(12, 4))
-
-plt.subplot(1, 3, 1)
-plt.imshow(cell_true[i], cmap='gray')
-plt.title("GT (body ∪ border)")
-
-plt.subplot(1, 3, 2)
-plt.imshow(cell_pred[i], cmap='gray')
-plt.title("Pred (body ∪ border)")
-
-plt.subplot(2, 3, 1)
-plt.imshow(cell_true[i] * cell_pred[i], cmap='gray')
-plt.title("Intersection")
-
-plt.subplot(2, 3, 2)
-plt.imshow(labels_pred[i], cmap='nipy_spectral')
-plt.title("Intersection")
-
-plt.tight_layout()
-plt.show()
 
 # Sblocco encoder
 for layer in model.layers:
     layer.trainable = True
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
 
 model.compile(
     optimizer=optimizer,

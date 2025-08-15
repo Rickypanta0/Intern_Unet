@@ -58,7 +58,7 @@ Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
-X = X + 15
+X = X + 10
 X_gray = X / 255
 #X_gray = np.dot(X_gray[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
 #HESOINE EXTRACTION
@@ -74,7 +74,7 @@ def extract_hematoxylin_rgb(img):
     return h_rgb_norm.astype(np.float32)
 
 # Applica al batch
-#X_processed = np.stack([extract_hematoxylin_rgb(img / 255.0) for img in X], axis=0) 
+X_processed = np.stack([extract_hematoxylin_rgb(img / 255.0) for img in X], axis=0) 
 #X_ = []
 #for f in X_gray:
 #    blu = f[...,2]
@@ -87,15 +87,15 @@ def extract_hematoxylin_rgb(img):
 #X_ = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
 
 # Split
-X_train, _, Y_train, _, HV_train, _ = train_test_split(
+X_val, _, Y_val, _, HV_val, _ = train_test_split(
     X_gray, Y, HV, test_size=0.1, random_state=SEED
 )
 from matplotlib.cm import get_cmap
-#X_train_rgb = np.repeat(X_train, 3, axis=-1)
-X_train_rgb = X_train
+#X_val_rgb = np.repeat(X_val, 3, axis=-1)
+X_val_rgb = X_val
 # Load model
 from src.losses import bce_dice_loss,hover_loss_fixed
-checkpoint_path='models/checkpoints/neo/model_BB_RGB.keras'
+checkpoint_path='models/checkpoints/neo/model_RGB.keras'
 
 model = load_model(
     checkpoint_path,
@@ -113,77 +113,64 @@ model = load_model(
 model.compile(
     optimizer=tf.keras.optimizers.Adam(1e-3),
     loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
-    loss_weights={"seg_head": 1.0, "hv_head": 1.0},
+    loss_weights={"seg_head": 1.0, "hv_head": 1.5},
 )
-preds = model.predict(X_train_rgb)
-seg_preds = preds['seg_head']
-hv_preds  = preds['hv_head']  # (batch, H, W, 2)
+preds = model.predict(X_val_rgb)
+seg_val_preds = preds['seg_head']
+hv_val_preds  = preds['hv_head']  # (batch, H, W, 2)
 #VISUAL CHECK
 
-for i in range(5):
-    isolated_count_blb, contour_img_blb, isolated_count_hv, contour_img_gt = nucle_counting(X_train, HV_train, Y_train, preds,i)
- 
-    seg = seg_preds[i]
-    hv = hv_preds[i]
-    hv_t = HV_train[i]
-    body_prob = seg[..., 0]
-    border_prob = seg[..., 2]
-    bg_prob = seg[..., 1]
-    # mappa di probabilità nuclei
-    prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
-    
-    print_results(X_train_rgb[i], prob_nucleus,contour_img_gt,prob_nucleus, hv_t[...,1],contour_img_blb,isolated_count_blb, isolated_count_hv)
-
+#for i in range(5):
+#    isolated_count_blb, contour_img_blb, isolated_count_hv, contour_img_gt = nucle_counting(X_val, HV_val, Y_val, preds,i)
+# 
+#    seg = seg_preds[i]
+#    hv = hv_preds[i]
+#    hv_t = HV_val[i]
+#    body_prob = seg[..., 0]
+#    border_prob = seg[..., 2]
+#    bg_prob = seg[..., 1]
+#    # mappa di probabilità nuclei
+#    prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+#    
+#    print_results(X_val_rgb[i], prob_nucleus,contour_img_gt,prob_nucleus, hv_t[...,1],contour_img_blb,isolated_count_blb, isolated_count_hv)
+#
 #CALC TOP TRESHOLD
 
-floats = np.arange(0.30, 0.61, 0.01)
-floats = np.round(floats, 2)  # per evitare problemi di arrotondamento
-errors = []
-for thld in tqdm(floats):
-    total_gt = 0
-    total_pred = 0
-    for i in range(X_train.shape[0]):
-        img = X_train[i]
-        seg = seg_preds[i]
-        hv = hv_preds[i]
-        hv_t = HV_train[i]
+def tune_params(X_val, Y_val, HV_val, seg_val, hv_val,
+                t_fg_grid, min_area_grid):
+    best = (1e9, 1e9)  # (MAE, sMAPE)
+    best_params = None
+    for t_fg in tqdm(t_fg_grid):
+        for min_area in min_area_grid:
+            abs_err = []
+            smape   = []
+            for i in range(len(X_val)):
+                P  = seg_val[i]
+                prob_pred = ((P[...,0]+P[...,2]) > P[...,1]).astype(np.float32)
+                pred_stack = np.stack([prob_pred, hv_val[i, ..., 0], hv_val[i, ..., 1]], axis=-1)
+                Lp = __proc_np_hv(pred_stack, GT=False, trhld=t_fg, min_area=min_area)
+                n_pred = int(Lp.max())
+                prob_gt = Y_val[i]
+                pred_gt = np.stack([prob_gt.squeeze(), HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
+                Lg = __proc_np_hv(pred_gt, GT=True, trhld=0.45, min_area=min_area)
+                n_gt = int(Lg.max())
+                abs_err.append(abs(n_pred - n_gt))
+                smape.append(2*abs(n_pred-n_gt)/(n_pred+n_gt+1e-6))
+            mae = float(np.mean(abs_err))
+            sm = float(np.mean(smape))
+            if (mae, sm) < best:
+                best = (mae, sm)
+                best_params = (t_fg, min_area, mae, sm)
+    return best_params
 
-        body_prob = seg[..., 0]
-        border_prob = seg[..., 2]
-        bg_prob = seg[..., 1]
+# Esempio d'uso (usa il VALIDATION set, non il train):
+t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
+t_seed_grid  = [0.55, 0.60, 0.65]
+min_area_grid= [10, 20, 30]
 
-        # mappa di probabilità nuclei
-        prob_nucleus = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
-        pred = np.stack([prob_nucleus, hv[..., 0], hv[..., 1]], axis=-1)
-
-        # segmentazione con watershed guidata da HV map
-        label_map = __proc_np_hv(pred,trhld=thld)
-
-        #print(Y_train[i].shape, hv_t[..., 0].shape)
-        pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
-        label_map_GT = __proc_np_hv(pred_GT, GT=True)
-        _, isolated_count_pred, _ = count_blob(label_map, prob_nucleus)
-        _, isolated_count_gt, _ = count_blob(label_map_GT, Y_train[i], GT=True)
-        
-        total_gt += isolated_count_gt
-        total_pred += isolated_count_pred
-
-    abs_error = abs(total_gt - total_pred)
-    rel_error = abs_error / total_gt if total_gt > 0 else float('inf')
-    errors.append((thld, abs_error, rel_error))
-    # Ordina per errore relativo
-errors.sort(key=lambda x: x[2])
-best_threshold = errors[0][0]
-print(f"Miglior treshold: {best_threshold}")
-
-#grafico errore
-
-plt.plot(floats, [e[2] for e in errors])
-plt.xlabel("Treshold")
-plt.ylabel("Relative Error")
-plt.title("Treshold optimization")
-plt.grid(True)
-plt.show()
+best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,
+                   t_fg_grid, min_area_grid)
+print(f"Migliori: t_fg={best[0]}, t_seed={best[1]}, min_area={best[2]} | MAE={best[3]:.2f}, sMAPE={best[4]:.3f}")
 
 
     
