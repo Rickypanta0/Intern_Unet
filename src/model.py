@@ -117,7 +117,7 @@ class OneHotMeanIoU(tf.keras.metrics.MeanIoU):
         y_pred = tf.argmax(y_pred, axis=-1)
         # poi chiamo la classe base
         return super().update_state(y_true, y_pred, sample_weight)
-def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
+def get_model_paper(input_shape=(256, 256, 3)):
     """
     Costruisce e compila il modello U-Net con architettura hardcoded.
 
@@ -244,13 +244,6 @@ def get_model_paper(input_shape=(256, 256, 3), learning_rate=1e-3):
     'hv_head': hv_head
     })
 
-    #import tensorflow_addons as tfa
-    #dice_metric = tfa.metrics.F1Score(
-    #    num_classes=1,                  # binario
-    #    average='micro',                # restituisce scalare, non rank‑0
-    #    threshold=0.5
-    #)
-
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-3,
         first_decay_steps=25,   # 10 epoche
@@ -281,99 +274,70 @@ from tensorflow.keras.layers import UpSampling2D, concatenate, Conv2D, BatchNorm
 from tensorflow.keras.models import Model
 
 
+import tensorflow as tf
+from tensorflow.keras.layers import (Input, UpSampling2D, Concatenate, Conv2D,
+                                     BatchNormalization, Activation, Dropout)
+from tensorflow.keras.models import Model
 
-def model_paper_hover(input_shape=(256,256,3)):
-    # 1) Input
-    inputs = tf.keras.Input(shape=input_shape)
+# blocchetto conv-bn-relu (+ opzionale dropout)
+def CBR(x, f, k=3, dr=None):
+    x = Conv2D(f, k, padding='same', use_bias=False, kernel_initializer='he_normal')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    if dr: x = Dropout(dr)(x)
+    return x
 
-    inputs = tf.keras.Input(input_shape)
+def build_unet_resnet50(input_shape=(256,256,3), freeze_encoder=True):
+    inp = Input(input_shape, name='image_in')
 
-    # ---- Encoder + Bottleneck ----
-    def conv_block(x, filters, dropout_rate):
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-        x = tf.keras.layers.Dropout(dropout_rate)(x)
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-        return x
+    # Preprocess sicuro (se lo usi)
+    # x_in = ResNetPreprocess(name="resnet_preproc")(inp)
+    # base = tf.keras.applications.ResNet50(include_top=False, weights='imagenet', input_tensor=x_in)
 
-    c1 = conv_block(inputs, 32, 0.1)
-    p1 = tf.keras.layers.MaxPooling2D()(c1)
+    # Se preferisci preprocess fuori, usa direttamente inp:
+    base = tf.keras.applications.ResNet50(include_top=False, 
+                                          weights='imagenet',
+                                          input_tensor=inp
+                                          )
 
-    c2 = conv_block(p1, 64, 0.1)
-    p2 = tf.keras.layers.MaxPooling2D()(c2)
+    if freeze_encoder:
+        for L in base.layers: L.trainable = False
 
-    c3 = conv_block(p2, 128, 0.2)
-    p3 = tf.keras.layers.MaxPooling2D()(c3)
+    # Skip dal ResNet
+    s1 = base.get_layer('conv1_relu').output          # 128x128
+    s2 = base.get_layer('conv2_block3_out').output    # 64x64
+    s3 = base.get_layer('conv3_block4_out').output    # 32x32
+    s4 = base.get_layer('conv4_block6_out').output    # 16x16
+    b  = base.get_layer('conv5_block3_out').output    # 8x8 (bottleneck)
 
-    c5 = conv_block(p3, 256, 0.3)
-    p5 = tf.keras.layers.MaxPooling2D()(c5)
-
-    c6 = conv_block(p5, 512, 0.3)
-    u1 = tf.keras.layers.UpSampling2D()(c6)
-
-    # ---- Decoder shared ----
-    def up_block(u, skip, filters, dropout_rate):
-        x = tf.keras.layers.concatenate([u, skip])
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-        x = tf.keras.layers.Dropout(dropout_rate)(x)
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-        return tf.keras.layers.UpSampling2D()(x)
-
-    u2 = up_block(u1, c5, 256, 0.2)
-    u3 = up_block(u2, c3, 128, 0.2)
-    u4 = up_block(u3, c2, 64, 0.05)
-    shared = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu', kernel_initializer='he_normal')(u4)
-    # ---- HoVerNet-style seg_head ----
-    x = shared
-    for filters in [64, 64, 32]:
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-    seg_head = tf.keras.layers.Conv2D(3, 1, activation='softmax', name='seg_head')(x)
-
-    # ---- HoVerNet-style hv_head ----
-    x = shared
-    for filters in [64, 64, 32]:
-        x = tf.keras.layers.Conv2D(filters, 3, padding='same', kernel_initializer='he_normal')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation('relu')(x)
-    hv_head = tf.keras.layers.Conv2D(2, 1, activation='linear', name='hv_head')(x)
+    # Decoder (solo upsampling + concat con skip ResNet) — NIENTE MaxPooling qui
+    x = UpSampling2D()(b);  x = Concatenate()([x, s4]); x = CBR(x, 256)
+    x = Dropout(0.2)(x); x = CBR(x, 256)
     
-    model = tf.keras.Model(inputs=inputs, outputs={'seg_head': seg_head, 'hv_head': hv_head})
+    x = UpSampling2D()(x);  x = Concatenate()([x, s3])
+    x = CBR(x, 128); x = Dropout(0.2)(x); x = CBR(x, 128)
+    
+    x = UpSampling2D()(x);  x = Concatenate()([x, s2])
+    x = CBR(x,  64); x = Dropout(0.05)(x); x = CBR(x,  64)
 
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=1e-3,
-        first_decay_steps=25,
-        t_mul=2.0,
-        m_mul=0.8,
-        alpha=1e-5 / 1e-3
-    )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    x = UpSampling2D()(x);  x = Concatenate()([x, s1])
+    x = CBR(x,  32); x = Dropout(0.05)(x); x = CBR(x,  32)
+    
+    x = UpSampling2D()(x);  x = CBR(x, 32)  # fino a 256×256
 
-    model.compile(
-        optimizer=optimizer,
-        loss={
-            'seg_head': bce_dice_loss,
-            'hv_head': hover_loss_fixed
-        },
-        loss_weights={
-            'seg_head': 1.0,
-            'hv_head': 1.0
-        },
-        metrics={
-            'seg_head': [CellDice()],
-            'hv_head': [tf.keras.metrics.MeanSquaredError()]
-        }
-    )
+    # Due head
+    c11 = Dropout(0.1)(x); c11 = CBR(c11, 16); c11 = Dropout(0.05)(c11); c11 = CBR(c11, 16)
+    c12 = Conv2D(16, 1, padding='same', kernel_initializer='he_normal')(c11)
+    c12 = Dropout(0.05)(c12); c12 = CBR(c12, 16); c12 = Conv2D(16, 1, padding='same', kernel_initializer='he_normal')(c12)
 
-    return model
+    seg_head = Conv2D(3, 1, activation='softmax', name='seg_head')(c12)
+
+    c12_hv = Conv2D(16, 1, padding='same', kernel_initializer='he_normal')(c11)
+    c12_hv = Dropout(0.05)(c12_hv); c12_hv = CBR(c12_hv, 16)
+    hv_head = Conv2D(2, 1, activation='linear', name='hv_head')(c12_hv)
+
+    return Model(inp, {'seg_head': seg_head, 'hv_head': hv_head}), base
+
 
 if __name__ == "__main__":
     # Test e summary

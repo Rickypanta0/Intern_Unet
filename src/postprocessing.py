@@ -89,7 +89,8 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     blb_raw =  1-pred[...,0]
     h_dir_raw = pred[..., 1]
     v_dir_raw = pred[..., 2]
-    
+    #if not GT:
+    #    print(h_dir_raw.min(), h_dir_raw.max()) 
     # processing
     blb = np.array(blb_raw >= 0.5, dtype=np.int32)
 
@@ -130,18 +131,18 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     boundary_mask_ = cv2.morphologyEx(boundary_mask,cv2.MORPH_OPEN,kernel, iterations = 2) if not GT else boundary_mask
     from skimage.measure import label
     markers = label(1-boundary_mask_)
-    #fig, axs = plt.subplots(1,3, figsize = (8,8))
-    #axs[0].imshow(boundary_mask_)
-    #axs[1].imshow(markers)
-    #axs[2].imshow(overall)
-    #plt.show()
+    
     #print("label markers: ", list(np.unique(markers)))
     from skimage.segmentation import watershed
     blb_ = 1-blb
     #plt.imshow(markers)
     #plt.show()
     instance_map = watershed(overall, markers, mask=blb_)
-
+    #fig, axs = plt.subplots(1,3, figsize = (8,8))
+    #axs[0].imshow(boundary_mask_)
+    #axs[1].imshow(markers)
+    #axs[2].imshow(instance_map)
+    #plt.show()
     return instance_map
 
 def count_blob(labels, blb, GT=False):

@@ -89,98 +89,93 @@ def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.T
 
 
 
-@register_keras_serializable()
-def weighted_bce_dice(y_true: tf.Tensor, y_pred: tf.Tensor,
-                      weight: float = 5.0,
-                      smooth: float = 1.0) -> tf.Tensor:
+def sobel_xy(t):
+    # t: (B,H,W,2) -> applico sobel a ciascun canale, poi concateno
+    # Sobel app standard via tf.image.sobel_edges (ritorna [..., 2, 2]: dy, dx)
+    # Qui estraggo dx,dy e li concateno per i 2 canali HV.
+    se = tf.image.sobel_edges(t)          # (B,H,W,2,2)
+    dy = se[..., 0]                       # (B,H,W,2)
+    dx = se[..., 1]                       # (B,H,W,2)
+    return dx, dy
+
+@tf.keras.utils.register_keras_serializable()
+def hover_loss(y_true, y_pred):
     """
-    Perdita composita pesata:
-      - BCE pixel-wise con mappa di pesi
-      - Dice Loss
-
-    Args:
-        y_true: tensor [B,H,W,1]
-        y_pred: tensor [B,H,W,1]
-        weight: peso applicato ai pixel di foreground
-        smooth: smoothing per Dice
-    Returns:
-        weighted BCE + Dice Loss
+    y_true: (B,H,W,3) con [HVx_true, HVy_true, mask_fg]  oppure
+            (B,H,W,2) con HV e mask_fg separata altrove: adatta di conseguenza.
+    y_pred: (B,H,W,2) con [HVx_pred, HVy_pred]
     """
-    # BCE pixel-wise
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    # Mappa di pesi
-    weight_map = tf.squeeze(y_true * weight + (1.0 - y_true), axis=-1)
-    weighted_bce = bce * weight_map
-    # Dice Loss
-    y_t = tf.reshape(tf.cast(y_true, tf.float32), [-1])
-    y_p = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
-    intersection = tf.reduce_sum(y_t * y_p)
-    dice = 1.0 - (2.0 * intersection + smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + smooth)
-    return tf.reduce_mean(weighted_bce) + dice
+    # separa HV_true e mask_fg
+    if y_true.shape[-1] == 3:
+        hv_t   = y_true['hv_head']
+        body, bg, border = tf.unstack(y_true['seg_head'], axis=-1)
+        mask_fg = tf.cast(body + border > bg, tf.float32)
+        #mask_fg = y_true[..., 2:3]     # (B,H,W,1), 1 nei nuclei, 0 altrove
+    else:
+        hv_t   = y_true
+        # SE non hai mask in y_true, metti tutto a 1 (meno consigliato)
+        mask_fg = tf.ones_like(hv_t[..., :1])
 
-@register_keras_serializable()
-def get_weighted_bce_dice_loss(weight: float = 5.0) -> callable:
+    hv_p = y_pred['hv_head']
+
+    # Huber sui valori HV (masked)
+    huber = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+    map_loss = huber(hv_t, hv_p)                     # (B,H,W,2)
+    map_loss = tf.reduce_sum(map_loss * mask_fg) / (tf.reduce_sum(mask_fg) + 1e-6)
+
+    # Gradiente (Sobel) su HV
+    dx_p, dy_p = sobel_xy(hv_p)
+    dx_t, dy_t = sobel_xy(hv_t)
+
+    grad_loss = huber(dx_t, dx_p) + huber(dy_t, dy_p)   # (B,H,W,2)
+    # peso extra su edge: approx = grad della mask_fg
+    edge = tf.image.sobel_edges(mask_fg)[...,0]**2 + tf.image.sobel_edges(mask_fg)[...,1]**2
+    edge = tf.reduce_sum(edge, axis=-1, keepdims=True)    # (B,H,W,1)
+    edge = edge / (tf.reduce_max(edge) + 1e-6)
+    w = 0.5*mask_fg + 0.5*edge                            # metà fg, metà edge
+
+    grad_loss = tf.reduce_sum(grad_loss * w) / (tf.reduce_sum(w) + 1e-6)
+
+    # pesi come nel paper/implementazioni comuni
+    return map_loss + 2.0 * grad_loss
+
+@tf.keras.utils.register_keras_serializable()
+def hovernet_hv_loss_tf(y_true, y_pred,
+                        lambda_hv_mse=2.0,
+                        lambda_hv_mse_grad=1.0):
     """
-    Restituisce una funzione di perdita parzializzata di weighted_bce_dice con peso fisso.
+    y_true: (B,H,W,3) -> [HVx_true, HVy_true, focus_mask]
+    y_pred: (B,H,W,2) -> [HVx_pred, HVy_pred]
+    focus_mask: 1 sui nuclei (body|border), 0 sul background
     """
-    return lambda y_true, y_pred: weighted_bce_dice(y_true, y_pred, weight=weight)
+    print(y_pred)
+    # separa target e mask
+    hv_t   = tf.cast(y_true[..., :2], tf.float32)   # (B,H,W,2)
+    focus  = tf.cast(y_true[..., 2:3], tf.float32)  # (B,H,W,1) 0/1
+    hv_p   = tf.cast(y_pred, tf.float32)            # (B,H,W,2)
 
-# Parametri default per CSCA
-_lambda1 = 2.0
-_lambda2 = 1.0
-_smooth = 1e-6
+    # ---------- 1) MSE HV (mascherata) ----------
+    mse_map = tf.square(hv_p - hv_t)                        # (B,H,W,2)
+    mse_map = tf.reduce_sum(mse_map * focus)                # somma su H,W,2
+    denom   = tf.reduce_sum(focus) * 2.0 + 1e-8            # *2 per due canali
+    loss_mse = mse_map / denom
 
+    # ---------- 2) MSE gradiente HV (mascherata) ----------
+    # tf.image.sobel_edges -> (B,H,W,C,2) dove ...,[dy, dx]
+    se_p = tf.image.sobel_edges(hv_p)   # (B,H,W,2,2)
+    se_t = tf.image.sobel_edges(hv_t)   # (B,H,W,2,2)
 
-def csca_binary_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """
-    Perdita composita CSCA per due classi (background vs foreground):
-      L = λ1 * BCE + λ2 * DiceLoss(FG)
+    # MONAI: grad orizzontale del canale H (dx su canale 0) e grad verticale del canale V (dy su canale 1)
+    grad_h_p = se_p[..., 0, 1]   # canale 0, dx
+    grad_h_t = se_t[..., 0, 1]
+    grad_v_p = se_p[..., 1, 0]   # canale 1, dy
+    grad_v_t = se_t[..., 1, 0]
 
-    Args:
-        y_true: tensor [B,H,W,1]
-        y_pred: tensor [B,H,W,1]
-    Returns:
-        Valore scalare della perdita composita
-    """
-    # Binary Crossentropy medio
-    bce = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
-    # Dice sul foreground
-    y_t = tf.reshape(tf.cast(y_true, tf.float32), [-1])
-    y_p = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
-    intersection = tf.reduce_sum(y_t * y_p)
-    dice_coeff = (2.0 * intersection + _smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + _smooth)
-    dice_loss_val = 1.0 - dice_coeff
-    return _lambda1 * bce + _lambda2 * dice_loss_val
-@register_keras_serializable()
-def dice_loss_class(y_true, y_pred, k, smooth=1e-6):
-    t = y_true[..., k]
-    p = y_pred[..., k]
-    inter = tf.reduce_sum(t * p, axis=[1,2])
-    denom = tf.reduce_sum(t, axis=[1,2]) + tf.reduce_sum(p, axis=[1,2])
-    return 1 - (2*inter + smooth)/(denom + smooth)
-@register_keras_serializable()
-def Lp(y_true, y_pred):
-    # Cp = CE multiclasse
-    cce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
-    Cp  = tf.reduce_mean(cce)
-    # D1 sul canale BD (k=0), D2 sul canale CB (k=2)
-    D1  = tf.reduce_mean(dice_loss_class(y_true, y_pred, k=0))
-    D2  = tf.reduce_mean(dice_loss_class(y_true, y_pred, k=2))
-    return 2*Cp + 1*D1 + 2*D2
+    grad_p = tf.stack([grad_h_p, grad_v_p], axis=-1)  # (B,H,W,2)
+    grad_t = tf.stack([grad_h_t, grad_v_t], axis=-1)
 
-# ————————————————————————————————
-# 2) Metriche binarie “nucleo vs background”:
-#    consideriamo “nucleo” i canali BD (0) e CB (2), background = canale BG (1)
-@register_keras_serializable()
-def binary_iou(y_true, y_pred):
-    # y_true, y_pred: (B,H,W,3) one-hot/softmax
-    # facciamo due maschere booleane: nucleo vs non-nucleo
-    true_labels = tf.argmax(y_true, axis=-1)    # 0=BD,1=BG,2=CB
-    pred_labels = tf.argmax(y_pred, axis=-1)
-    true_bin = tf.cast(tf.not_equal(true_labels, 1), tf.int32)
-    pred_bin = tf.cast(tf.not_equal(pred_labels, 1), tf.int32)
-    # intersection & union per batch
-    intersection = tf.reduce_sum(tf.cast(true_bin & pred_bin, tf.float32), axis=[1,2])
-    union        = tf.reduce_sum(tf.cast(true_bin | pred_bin, tf.float32), axis=[1,2])
-    iou = (intersection + 1e-6) / (union + 1e-6)
-    return tf.reduce_mean(iou)
+    grad_se = tf.square(grad_p - grad_t)             # (B,H,W,2)
+    grad_se = tf.reduce_sum(grad_se * focus)         # somma su H,W,2
+    loss_grad = grad_se / denom
+
+    return lambda_hv_mse * loss_mse + lambda_hv_mse_grad * loss_grad

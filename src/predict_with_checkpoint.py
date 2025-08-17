@@ -58,7 +58,7 @@ Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
-X = X + 10
+X = X + 0
 X_gray = X / 255
 #X_gray = np.dot(X_gray[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
 #HESOINE EXTRACTION
@@ -92,18 +92,29 @@ X_val, _, Y_val, _, HV_val, _ = train_test_split(
 )
 from matplotlib.cm import get_cmap
 #X_val_rgb = np.repeat(X_val, 3, axis=-1)
-X_val_rgb = X_val
 # Load model
-from src.losses import bce_dice_loss,hover_loss_fixed
-checkpoint_path='models/checkpoints/neo/model_RGB.keras'
+@tf.keras.utils.register_keras_serializable(package="preproc")
+class ResNetPreprocess(tf.keras.layers.Layer):
+    def call(self, x):
+        x = tf.cast(x, tf.float32) * 255.0
+        # RGB -> BGR
+        x = x[..., ::-1]
+        mean = tf.constant([103.939, 116.779, 123.68], dtype=tf.float32)
+        return x - mean[None, None, None, :]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape  # shape invariata
+from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf
+checkpoint_path='models/checkpoints/neo/model_BB_RGB2_third.keras'
 
 model = load_model(
     checkpoint_path,
     custom_objects={
-        "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
-        "HVLoss": hover_loss_fixed
+        "bce_dice_loss": bce_dice_loss,
+        "hover_loss_fixed": hovernet_hv_loss_tf,
     },
-    compile=False                    # ← evita la ricompilazione automatica
+    compile=False,
+    safe_mode=False                   # ← evita la ricompilazione automatica
 )
 
 # --------------------------------------------
@@ -112,10 +123,12 @@ model = load_model(
 
 model.compile(
     optimizer=tf.keras.optimizers.Adam(1e-3),
-    loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
-    loss_weights={"seg_head": 1.0, "hv_head": 1.5},
+    loss={"seg_head": bce_dice_loss, "hv_head": hovernet_hv_loss_tf},
+    loss_weights={"seg_head": 1.0, "hv_head": 2.0},
 )
-preds = model.predict(X_val_rgb)
+from tensorflow.keras.applications.resnet import preprocess_input
+X_val = X_val.astype(np.float32)
+preds = model.predict(preprocess_input(X_val*255), batch_size=4)
 seg_val_preds = preds['seg_head']
 hv_val_preds  = preds['hv_head']  # (batch, H, W, 2)
 #VISUAL CHECK
@@ -165,12 +178,12 @@ def tune_params(X_val, Y_val, HV_val, seg_val, hv_val,
 
 # Esempio d'uso (usa il VALIDATION set, non il train):
 t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
-t_seed_grid  = [0.55, 0.60, 0.65]
+#t_seed_grid  = [0.55, 0.60, 0.65]
 min_area_grid= [10, 20, 30]
 
 best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,
                    t_fg_grid, min_area_grid)
-print(f"Migliori: t_fg={best[0]}, t_seed={best[1]}, min_area={best[2]} | MAE={best[3]:.2f}, sMAPE={best[4]:.3f}")
+print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
 
 
     

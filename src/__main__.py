@@ -4,7 +4,7 @@ import tensorflow as tf
 import numpy as np
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
-from src.model import get_model_paper, model_paper_hover
+from src.model import get_model_paper
 import math 
 from tensorflow import keras 
 from matplotlib.cm import get_cmap
@@ -12,7 +12,7 @@ import tensorflow_io as tfio
 #from src.test_augm import build_instance_map_valuewise, GenInstanceHV
 import cv2
 from skimage.exposure import rescale_intensity
-
+from tensorflow.keras.applications.resnet import preprocess_input
 BACKBONE = 'resnet34'
 
 """
@@ -252,7 +252,7 @@ class DataGenerator(keras.utils.Sequence):
 
         X = np.empty((N, H, W, C), dtype=np.float32)
         Y = np.empty((N, H, W, 3), dtype=np.float32)
-        HV = np.empty((N, H, W, 2), dtype=np.float32)
+        HV = np.empty((N, H, W, 3), dtype=np.float32)
 
         i=0
         #for fold_idx, local_idx in list_temp:
@@ -274,7 +274,7 @@ class DataGenerator(keras.utils.Sequence):
             img_path, mask_path, hv_path = self.folds[fold_idx]
 
             img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img + 10) / 255.0
+            img_rgb = (img + 0) / 255.0
             
             #HESOINE EXTRACTION
             
@@ -302,38 +302,41 @@ class DataGenerator(keras.utils.Sequence):
                 mask = np.squeeze(mask, axis=-1)
 
             hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
-            mask = self._make_target_3ch(mask)
+            mask_ = self._make_target_3ch(mask)
 
             # Augmentation
             if self.augment:
                 if np.random.rand() < 0.5:
                     img_rgb = np.fliplr(img_rgb)
-                    mask   = np.fliplr(mask)
+                    mask_   = np.fliplr(mask_)
                     hv      = np.fliplr(hv)
                     hv[...,0] *= -1  # inverti x
                 if np.random.rand() < 0.5:
                     img_rgb = np.flipud(img_rgb)
-                    mask   = np.flipud(mask)
+                    mask_   = np.flipud(mask_)
                     hv      = np.flipud(hv)
                     hv[...,1] *= -1  # inverti y
                 k = np.random.randint(4) 
                 #print(mask.shape)
                 img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
-                mask   = np.rot90(mask,   k, axes=(0, 1))
+                mask_   = np.rot90(mask_,   k, axes=(0, 1))
                 hv      = np.rot90(hv,      k, axes=(0, 1))
 
                 if   k == 1: hv = np.stack([-hv[...,1],  hv[...,0]], axis=-1)
                 elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
                 elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
 
-            X[i] = img_rgb
-            Y[i] = mask
-            HV[i] = hv
+            X[i] = preprocess_input(img_rgb*255)
+            Y[i] = mask_
+            HV[i] = np.dstack([hv, mask])   
 
         return X, {'seg_head': Y, 'hv_head': HV}
     
 from tensorflow.keras.utils import register_keras_serializable
-
+@tf.keras.utils.register_keras_serializable()
+def hv_mse_metric(y_true, y_pred):
+    # MSE non mascherata, solo sui primi 2 canali
+    return tf.reduce_mean(tf.square(tf.cast(y_pred, tf.float32) - tf.cast(y_true[..., :2], tf.float32)))
 @register_keras_serializable()
 class CellDice(tf.keras.metrics.Metric):
     """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
@@ -393,13 +396,14 @@ if __name__=="__main__":
     val_gen = DataGenerator(folds, val_IDs, batch_size=4, shuffle=False, augment=False)
 
     monitor_metric = 'val_seg_head_cell_dice'
-
+    from tensorflow.keras import mixed_precision
+    #mixed_precision.set_global_policy('mixed_float16')
     #Dynamic Learning rate
     reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
         monitor=monitor_metric,
         factor=0.5,
         patience=3,
-        min_lr=1e-5,
+        min_lr=1e-4,
         mode="max",
         verbose=1
     )
@@ -409,7 +413,7 @@ if __name__=="__main__":
             histogram_freq=1,
             write_images=True
         )
-    checkpoint_path='models/checkpoints/neo/model_RGB1.keras'
+    checkpoint_path='models/checkpoints/neo/model_BB_RGB2.keras'
         # Checkpoint
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
@@ -439,7 +443,7 @@ if __name__=="__main__":
     """"""
     for i in range(idx,idx + 4):
         fig, axs = plt.subplots(2, 3, figsize=(6,6))
-        image = Xb[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+        image = Xb[i]        # (H, W, 3) – RGB image (non usata da GenInstanceHV)
         mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
         hv = Yb['hv_head'][i]
         body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
@@ -447,7 +451,7 @@ if __name__=="__main__":
         background = mask_3ch[..., 1].astype(np.uint8)
 
         C = np.logical_or(body_mask, border_mask).astype(np.uint8)
-        axs[0,0].imshow(Xb[i])                         # immagine normalizzata [0,1]
+        axs[0,0].imshow(image)                         # immagine normalizzata [0,1]
         axs[0,1].imshow(body_mask, cmap='gray')  # body
         axs[0,2].imshow(background, cmap='gray')  # background
         axs[1,0].imshow(border_mask, cmap='gray')  # border
@@ -456,241 +460,144 @@ if __name__=="__main__":
     
         plt.tight_layout()
         plt.show()
-    """
-    model = get_model_paper()
-    
-    #model_ = model_paper_hover()
-    history = model.fit(train_gen,
-            validation_data=val_gen, 
-            epochs=60, 
-            callbacks=[
-                earlystop_cb,
-                checkpoint_cb,
-                tensorboard_cb,
-            ],
-            verbose=1)
-    """
-    
-    #SECONDO ROUND
-    
-    from src.losses import bce_dice_loss,hover_loss_fixed
-    from tensorflow.keras.utils import register_keras_serializable
-    
+
+    from src.model import build_unet_resnet50
+    from src.losses import bce_dice_loss,hover_loss_fixed,hover_loss,hovernet_hv_loss_tf
+
+    model, base = build_unet_resnet50()
+
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=1e-3,
-        first_decay_steps=10 * len(train_gen),   # es.: 10 epoche
-        t_mul=2.0,
-        m_mul=0.8,
-        alpha=1e-5 / 1e-3
-    )
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-    best = tf.keras.models.load_model(
-        "models/checkpoints/neo/model_RGB.keras",
-        custom_objects={"CellDice": CellDice,
-                        "bce_dice_loss": bce_dice_loss,
-                        "hover_loss_fixed": hover_loss_fixed}
-    )
-
-    # 2. Ricompila con loss_weights nuovi e/o LR schedule diverso
-    best.compile(
-        optimizer=optimizer,
-        loss={'seg_head': bce_dice_loss,
-              'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 0.25, 'hv_head': 5},
-        metrics={'seg_head': [CellDice()], 'hv_head': []}
-    )
-
-    # 3. Continua l’addestramento
-    history = best.fit(train_gen,
-                       validation_data=val_gen,
-                       epochs=20,             # numero epoche aggiuntive
-                       callbacks=[checkpoint_cb, earlystop_cb],
-                       verbose=1)
-    
-    """
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=1e-4,
-        first_decay_steps=10 * len(train_gen),   # es.: 10 epoche
-        alpha=0.5
-    )
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-    model = tf.keras.models.load_model(
-        "models/checkpoints/model_RGB_HV_v2.keras",
-        custom_objects={"CellDice": CellDice,
-                        "bce_dice_loss": bce_dice_loss,
-                        "hover_loss_fixed": hover_loss_fixed}
-    )
-    def ancestors(layer):
-        seen = set()
-        stack = [layer]
-        while stack:
-            L = stack.pop()
-            if L in seen:
-                continue
-            seen.add(L)
-            # percorri i nodi in ingresso al layer
-            for node in getattr(L, "_inbound_nodes", []):
-                for t in getattr(node, "input_tensors", []):
-                    # ogni tensor porta al layer sorgente tramite _keras_history
-                    src = getattr(getattr(t, "_keras_history", None), "layer", None)
-                    if src is not None:
-                        stack.append(src)
-        return seen
-
-    hv_layer  = model.get_layer("hv_head")
-    seg_layer = model.get_layer("seg_head")
-
-    hv_anc  = ancestors(hv_layer)
-    seg_anc = ancestors(seg_layer)
-
-    unique_hv_layers = hv_anc - seg_anc   # solo i layer della branchetta HV
-    unique_seg_layers = seg_anc - hv_anc
-
-    # Opzionale: togli InputLayer se presente
-    unique_hv_layers = {L for L in unique_hv_layers if L.__class__.__name__ != "InputLayer"}
-    unique_seg_layers = {L for L in unique_seg_layers if L.__class__.__name__ != "InputLayer"}
-
-    for L in unique_seg_layers:
-        L.trainable = False
-    # 2. Ricompila con loss_weights nuovi e/o LR schedule diverso
-    model.compile(
-        optimizer=optimizer,
-        loss={'seg_head': bce_dice_loss,
-              'hv_head' : hover_loss_fixed},
-        loss_weights={'seg_head': 1.0, 'hv_head': 2.0},
-        metrics={'seg_head': [CellDice()], 'hv_head': []}
-    )
-    earlystop_cb = tf.keras.callbacks.EarlyStopping(
-        monitor='val_seg_head_cell_dice',
-        mode='max',
-        patience=4,
-        restore_best_weights=True
-    )
-    # 3. Continua l’addestramento
-    history = model.fit(train_gen,
-                       validation_data=val_gen,
-                       epochs=20,             # numero epoche aggiuntive
-                       callbacks=[checkpoint_cb, earlystop_cb],
-                       verbose=1)
-"""
-"""
-from src.losses import bce_dice_loss,hover_loss_fixed
-from tensorflow.keras.metrics import F1Score
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.layers import Conv2D, UpSampling2D, Concatenate, Input
-from tensorflow.keras.models import Model
-
-def build_unet_resnet34(input_shape=(256, 256, 3), freeze_encoder=True):
-    # Encoder: ResNet34 senza top
-    base_model = tf.keras.applications.ResNet50(
-        include_top=False,  # no classification head
-        weights='imagenet',
-        input_shape=input_shape
-    )
-    
-    if freeze_encoder:
-        for layer in base_model.layers:
-            layer.trainable = False
-
-    # Estraggo feature maps da diversi blocchi
-    skips = [
-        base_model.get_layer('conv1_relu').output,   # 128x128
-        base_model.get_layer('conv2_block3_out').output, # 64x64
-        base_model.get_layer('conv3_block4_out').output, # 32x32
-        base_model.get_layer('conv4_block6_out').output  # 16x16
-    ]
-    x = base_model.get_layer('conv5_block3_out').output  # 8x8
-
-    # Decoder: upsampling + concatenazione con skip connection
-    for skip in reversed(skips):
-        x = UpSampling2D()(x)
-        x = Concatenate()([x, skip])
-        x = Conv2D(256, 3, padding='same', activation='relu')(x)
-        x = Conv2D(256, 3, padding='same', activation='relu')(x)
-
-    # Output finale decoder: 256x256
-    x = UpSampling2D()(x)
-
-    return base_model.input, x
-
-inputs, decoder_output = build_unet_resnet34(input_shape=(256,256,3), freeze_encoder=True)
-tf.config.run_functions_eagerly(True)
-# Head segmentazione
-seg_head = Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
-seg_head = Conv2D(3, (1, 1), activation='softmax', name='seg_head')(seg_head)
-
-# Head HoVer (regressione)
-hv_head = Conv2D(16, (3, 3), padding='same', activation='relu')(decoder_output)
-hv_head = Conv2D(2, (1, 1), activation='linear', name='hv_head')(hv_head)
-
-# Modello finale
-model = Model(inputs=inputs, outputs={'seg_head': seg_head, 'hv_head': hv_head})
-
-lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-3,
         first_decay_steps=25,   # 10 epoche
         t_mul=2.0,                                # lunghezza fase raddoppia
         m_mul=0.8,                                # ampiezza si riduce
         alpha=1e-5 / 1e-3                         # min_lr
     )
-optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule,
+                                         weight_decay=1e-4,
+                                         clipnorm=1.0)
 
-model.compile(
+    model.compile(
     optimizer=optimizer,
     loss={
         'seg_head': bce_dice_loss,
-        'hv_head': hover_loss_fixed
+        'hv_head': hovernet_hv_loss_tf  # <--- funzione non parametrica
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 2.0
+        'hv_head': 1.0
     },
     metrics={'seg_head': [CellDice()],
-             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
+             'hv_head' : [hv_mse_metric]}
 )
-model.fit(train_gen,
-          validation_data=val_gen,
-          epochs=50,
-          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb],
-          verbose=1)
+    
+    h1 = model.fit(train_gen,
+                        validation_data=val_gen,
+                        epochs=50,
+                        callbacks=[
+                            earlystop_cb,
+                            checkpoint_cb,
+                            tensorboard_cb,
+                        ],
+                        verbose=1
+                        )
+    
+    for L in model.layers:
+        if 'conv5' in L.name: L.trainable = True
 
-# Sblocco encoder
-for layer in model.layers:
-    layer.trainable = True
+    opt = tf.keras.optimizers.SGD(learning_rate=3e-4, 
+                                  momentum=0.9,
+                                  nesterov=True, 
+                                  weight_decay=1e-4
+                                  )
+    
+    model.compile(optimizer=opt,
+                  loss={'seg_head': bce_dice_loss,
+                        'hv_head': hovernet_hv_loss_tf},
+                  loss_weights={'seg_head': 1.0,
+                                 'hv_head': 1.5}
+                                 )
+    
+    checkpoint_path='models/checkpoints/neo/model_BB_RGB2_second.keras'
+        # Checkpoint
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_path,
+            save_best_only=True,
+            save_weights_only=False,
+            monitor=monitor_metric,
+            mode="max",
+            verbose=1
+        )
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    h2 = model.fit(train_gen, 
+              validation_data=val_gen, 
+              epochs=8,
+              callbacks=[
+                earlystop_cb,
+                checkpoint_cb,
+                tensorboard_cb,
+                        ],
+              verbose=1
+                         )
 
-model.compile(
-    optimizer=optimizer,
-    loss={
-        'seg_head': bce_dice_loss,
-        'hv_head': hover_loss_fixed
-    },
-    loss_weights={
-        'seg_head': 1.0,
-        'hv_head': 1.5
-    },
-    metrics={'seg_head': [CellDice()],
-             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
-)
-# Allenamento completo
-history = model.fit(train_gen,
-          validation_data=val_gen,
-          epochs=50,
-          callbacks=[earlystop_cb, checkpoint_cb, tensorboard_cb, reduce_lr_cb],
-          verbose=1)
-"""
+    # tutto il backbone
+    for L in model.layers: L.trainable = True
+
+    opt = tf.keras.optimizers.SGD(learning_rate=1e-4, 
+                                  momentum=0.9,
+                                  nesterov=True, 
+                                  weight_decay=1e-4
+                                  )
+    
+    model.compile(optimizer=opt,
+                  loss={'seg_head': bce_dice_loss,
+                        'hv_head': hovernet_hv_loss_tf},
+                  loss_weights={'seg_head': 1.0,
+                                 'hv_head': 2.0}
+                                 )
+    
+    checkpoint_path='models/checkpoints/neo/model_BB_RGB2_third.keras'
+        # Checkpoint
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_path,
+            save_best_only=True,
+            save_weights_only=False,
+            monitor=monitor_metric,
+            mode="max",
+            verbose=1
+        )
+
+    h3 = model.fit(train_gen, 
+              validation_data=val_gen,
+             epochs=30,
+             callbacks=[
+                earlystop_cb,
+                checkpoint_cb,
+                tensorboard_cb,
+            ],
+            verbose=1)
+
 #OVERFITTING ?
-hist = history.history           # dizionario {metric_name: [e1, e2, ...]}
-plt.figure(figsize=(6, 4))
-plt.plot(hist['loss'],     label='train loss')
-plt.plot(hist['val_loss'], label='val loss')
-plt.xlabel('Epoch'); plt.ylabel('Loss')
-plt.title('Loss curves'); plt.legend(); plt.tight_layout()
-plt.show()
+histories = [h1.history, h2.history, h3.history]
+metrics = set().union(*[h.keys() for h in histories])
+
+merged = {
+    m: np.concatenate([np.array(h.get(m, []), dtype=float) for h in histories])
+    for m in metrics
+}
+
+# indici epoca cumulativi
+n1, n2, n3 = len(h1.history['loss']), len(h2.history['loss']), len(h3.history['loss'])
+epochs = np.arange(1, n1 + n2 + n3 + 1)
+
+# --- PLOT ---
+plt.figure(figsize=(7,4))
+plt.plot(epochs, merged['loss'], label='train loss')
+plt.plot(epochs, merged['val_loss'], label='val loss')
+# linee verticali a separare le fasi
+plt.axvline(n1+0.5, ls='--', alpha=0.5, label='Phase boundary')
+plt.axvline(n1+n2+0.5, ls='--', alpha=0.5)
+plt.xlabel('Epoch (cumulative)'); plt.ylabel('Loss'); plt.title('Unified loss')
+plt.legend(); plt.tight_layout(); plt.show()
     
     

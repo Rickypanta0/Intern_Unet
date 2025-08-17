@@ -2,7 +2,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from src.losses import bce_dice_loss, hover_loss_fixed
+from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf
 from tensorflow.keras.models import load_model
 import tensorflow as tf
 from skimage.color import rgb2hed, hed2rgb
@@ -12,6 +12,19 @@ from src.utils.metrics import get_fast_dice_2, get_fast_aji,get_fast_pq
 import pandas as pd
 import gc
 from keras import backend as K
+from tensorflow.keras.applications.resnet import preprocess_input
+@tf.keras.utils.register_keras_serializable(package="preproc")
+class ResNetPreprocess(tf.keras.layers.Layer):
+    def call(self, x):
+        x = tf.cast(x, tf.float32) * 255.0
+        # RGB -> BGR
+        x = x[..., ::-1]
+        mean = tf.constant([103.939, 116.779, 123.68], dtype=tf.float32)
+        return x - mean[None, None, None, :]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape  # shape invariata
+    
 class DiceScore(tf.keras.metrics.Metric):
     """
     Dice coefficient (a.k.a. F1 per segmentazione binaria).
@@ -59,14 +72,14 @@ def loadmodel(checkpoint_path, weight_seg_head=1.0, weight_hv_head=1.0):
         checkpoint_path,
         custom_objects={
             "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
-            "HVLoss": hover_loss_fixed
+            "HVLoss": hovernet_hv_loss_tf
         },
         compile=False                    # ← evita la ricompilazione automatica
     )
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss={"seg_head": bce_dice_loss, "hv_head": hover_loss_fixed},
+        loss={"seg_head": bce_dice_loss, "hv_head": hovernet_hv_loss_tf},
         loss_weights={"seg_head": weight_seg_head, "hv_head": weight_hv_head},
     )
     return model
@@ -74,7 +87,7 @@ from torchmetrics.classification import JaccardIndex
 import torch
 
 from tensorflow.keras.metrics import F1Score, IoU
-def score_testSet(preds, Y, HV, X):
+def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     H = 256
     W = 256
     I_f1_list = []
@@ -113,7 +126,7 @@ def score_testSet(preds, Y, HV, X):
             continue
 
         pred = np.stack([y_pred_bin, hv[..., 0], hv[..., 1]], axis=-1)
-        label_pred = __proc_np_hv(pred,trhld=0.43)
+        label_pred = __proc_np_hv(pred,trhld=trhld, min_area=min_area)
 
         pred_GT = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
         label_true = __proc_np_hv(pred_GT, GT=True)
@@ -168,11 +181,14 @@ def hema_rgb( img_rgb01):  # img in [0,1]
         hema_only = np.stack([H, np.zeros_like(H), np.zeros_like(H)], axis=-1)
         img_h = hed2rgb(hema_only).astype(np.float32)  # torna in RGB
         return np.clip(img_h, 0, 1) 
-
-def pre_proces(checkpoint, X, weight_hv_head=1.0):
+from tensorflow.keras.applications.resnet import preprocess_input
+def pre_proces(checkpoint, X, weight_hv_head=2.0):
     if 'RGB' in checkpoint:
-        X = np.clip(X + 15, 0, 255)
-        X = X / 255.0
+        X_ = []
+        for f in X:
+            img_prep = preprocess_input(f)
+            X_.append(img_prep)
+        X = np.stack(X_, axis=0)
     elif 'HE' in checkpoint:
         X = X / 255.0
         X_ = []
@@ -225,7 +241,7 @@ def labels_scores(checkpoint, Y, HV):
 from src.postprocessing import __proc_np_hv
 from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
-def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds):
+def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds, trhld=0.43, min_area=10):
     N_gt = []
     N_pred = []
 
@@ -245,7 +261,7 @@ def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds):
         hv = hv_preds[i]
         pred = np.stack([mask_pred, hv[..., 0], hv[..., 1]], axis=-1)
         # segmentazione con watershed guidata da HV map
-        label_pred = __proc_np_hv(pred,trhld=0.43)
+        label_pred = __proc_np_hv(pred,trhld=trhld, min_area=min_area)
 
         #determinazione labels GT
         hv_t = test_set_hv[i]
@@ -333,7 +349,25 @@ def test_count_bias(
         wilcoxon_stat=w_stat, wilcoxon_p=w_p
     )
 
-
+def plot_bias_histogram(N_gt, N_pred, res, bins=30, title="Bias di conteggio"):
+    diff = np.asarray(N_pred, float) - np.asarray(N_gt, float)
+    diff = diff[np.isfinite(diff)]
+    plt.figure(figsize=(6,4))
+    plt.hist(diff, bins=bins, alpha=0.85)
+    # linee: media e intervallo di confidenza
+    plt.axvline(res.mean_diff, color='tab:orange', lw=2, label=f"media = {res.mean_diff:.2f}")
+    plt.axvline(res.ci95[0],   color='tab:red', ls='--', lw=1.5, label=f"IC95%: [{res.ci95[0]:.2f}, {res.ci95[1]:.2f}]")
+    plt.axvline(res.ci95[1],   color='tab:red', ls='--', lw=1.5)
+    plt.axvline(0, color='k', lw=1)
+    plt.xlabel("Differenza (Pred − GT)")
+    plt.ylabel("Frequenza")
+    plt.title(title)
+    txt = f"t = {res.t_stat:.2f}, p = {res.t_p:.3e}\n" \
+          f"Wilcoxon p = {res.wilcoxon_p:.3e}" if res.wilcoxon_p is not None else \
+          f"t = {res.t_stat:.2f}, p = {res.t_p:.3e}"
+    plt.legend()
+    plt.grid(alpha=0.2)
+    plt.show()
 
 base = os.path.join('data', 'raw_neoplastic')
 folds = [
@@ -361,6 +395,12 @@ X = np.concatenate(imgs_list, axis=0)
 Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
+print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
+print("per-channel min/max:",
+      HV[...,0].min(), HV[...,0].max(),
+      HV[...,1].min(), HV[...,1].max())
+print("channels equal? mean|x-y| =", np.mean(np.abs(HV[...,0]-HV[...,1])))
+
 # Preprocess input images
 
 k = min(4, X.shape[0])                                 # quante immagini mostrare
@@ -370,7 +410,7 @@ idx = np.random.randint(0, high)
 
 checkpoint_Blu='models/checkpoints/neo/model_BB_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB2_third.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
 checkpoint_paths=[checkpoint_RGB]
@@ -416,9 +456,11 @@ for i in range(idx,idx + 4):
 
     plt.tight_layout()
     plt.show()
-#N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds)
 
-v, v_ = score_testSet(preds, Y, HV, X)
+N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=0.37, min_area=20)
+
+v, v_ = score_testSet(preds, Y, HV, X, trhld=0.37, min_area=20)
+
 print(v,v_)
 print(f"checkpoint: {checkpoint_RGB}\n")
 print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
@@ -434,27 +476,7 @@ scores_IoU = [0.7296468019485474]
 # Mostra tabella
 #print_labels_with_plot(scores_F1, scores_Dice, scores_IoU)   
 
-#res_bias = test_count_bias(N_gt, N_pred_rgb)
+res_bias = test_count_bias(N_gt, N_pred_rgb)
 
-def plot_bias_histogram(N_gt, N_pred, res, bins=30, title="Bias di conteggio"):
-    diff = np.asarray(N_pred, float) - np.asarray(N_gt, float)
-    diff = diff[np.isfinite(diff)]
-    plt.figure(figsize=(6,4))
-    plt.hist(diff, bins=bins, alpha=0.85)
-    # linee: media e intervallo di confidenza
-    plt.axvline(res.mean_diff, color='tab:orange', lw=2, label=f"media = {res.mean_diff:.2f}")
-    plt.axvline(res.ci95[0],   color='tab:red', ls='--', lw=1.5, label=f"IC95%: [{res.ci95[0]:.2f}, {res.ci95[1]:.2f}]")
-    plt.axvline(res.ci95[1],   color='tab:red', ls='--', lw=1.5)
-    plt.axvline(0, color='k', lw=1)
-    plt.xlabel("Differenza (Pred − GT)")
-    plt.ylabel("Frequenza")
-    plt.title(title)
-    txt = f"t = {res.t_stat:.2f}, p = {res.t_p:.3e}\n" \
-          f"Wilcoxon p = {res.wilcoxon_p:.3e}" if res.wilcoxon_p is not None else \
-          f"t = {res.t_stat:.2f}, p = {res.t_p:.3e}"
-    plt.legend()
-    plt.grid(alpha=0.2)
-    plt.show()
-
-#plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello Blu")
-#print(res_bias)
+plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
+print(res_bias)
