@@ -1,5 +1,13 @@
 
 import os
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"    # opzionale ma consigliato
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"            # meno rumore nei log
+
+import tensorflow as tf
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
 import tensorflow as tf
 import numpy as np
 from scipy.ndimage import binary_erosion
@@ -274,7 +282,7 @@ class DataGenerator(keras.utils.Sequence):
             img_path, mask_path, hv_path = self.folds[fold_idx]
 
             img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img + 0) / 255.0
+            img_rgb = (img + 5) / 255.0
             
             #HESOINE EXTRACTION
             
@@ -302,32 +310,31 @@ class DataGenerator(keras.utils.Sequence):
                 mask = np.squeeze(mask, axis=-1)
 
             hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
-            mask_ = self._make_target_3ch(mask)
 
             # Augmentation
             if self.augment:
                 if np.random.rand() < 0.5:
                     img_rgb = np.fliplr(img_rgb)
-                    mask_   = np.fliplr(mask_)
+                    mask   = np.fliplr(mask)
                     hv      = np.fliplr(hv)
                     hv[...,0] *= -1  # inverti x
                 if np.random.rand() < 0.5:
                     img_rgb = np.flipud(img_rgb)
-                    mask_   = np.flipud(mask_)
+                    mask   = np.flipud(mask)
                     hv      = np.flipud(hv)
                     hv[...,1] *= -1  # inverti y
                 k = np.random.randint(4) 
                 #print(mask.shape)
                 img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
-                mask_   = np.rot90(mask_,   k, axes=(0, 1))
+                mask   = np.rot90(mask,   k, axes=(0, 1))
                 hv      = np.rot90(hv,      k, axes=(0, 1))
 
                 if   k == 1: hv = np.stack([-hv[...,1],  hv[...,0]], axis=-1)
                 elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
                 elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
 
-            X[i] = preprocess_input(img_rgb*255)
-            Y[i] = mask_
+            X[i] = img_rgb#preprocess_input(img_rgb*255)
+            Y[i] = self._make_target_3ch(mask)
             HV[i] = np.dstack([hv, mask])   
 
         return X, {'seg_head': Y, 'hv_head': HV}
@@ -382,7 +389,22 @@ if __name__=="__main__":
          os.path.join(base, 'Fold 2', 'masks', 'distance.npy'))
     ]
 
+    @tf.keras.utils.register_keras_serializable()
+    def hv_grad_mse_metric(y_true, y_pred):
+        hv_t  = tf.cast(y_true[..., :2], tf.float32)
+        hv_p  = tf.cast(y_pred, tf.float32)
+        focus = tf.cast(y_true[..., 2:3], tf.float32)
 
+        se_p = tf.image.sobel_edges(hv_p)
+        se_t = tf.image.sobel_edges(hv_t)
+        grad_h_p = se_p[..., 0, 1]; grad_h_t = se_t[..., 0, 1]
+        grad_v_p = se_p[..., 1, 0]; grad_v_t = se_t[..., 1, 0]
+        grad_p = tf.stack([grad_h_p, grad_v_p], axis=-1)
+        grad_t = tf.stack([grad_h_t, grad_v_t], axis=-1)
+
+        se = tf.square(grad_p - grad_t)
+        denom = tf.reduce_sum(focus) * 2.0 + 1e-8
+        return tf.reduce_sum(se * focus) / denom
     num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
 
     all_IDs = np.arange(num_all)
@@ -392,10 +414,12 @@ if __name__=="__main__":
     val_IDs   = all_IDs[split:]
     # generatori
     #print(val_IDs)
-    train_gen = DataGenerator(folds, train_IDs, batch_size=4, shuffle=True, augment=True)
-    val_gen = DataGenerator(folds, val_IDs, batch_size=4, shuffle=False, augment=False)
+    train_gen = DataGenerator(folds, train_IDs, batch_size=8, shuffle=True, augment=True)
+    val_gen = DataGenerator(folds, val_IDs, batch_size=8, shuffle=False, augment=False)
 
     monitor_metric = 'val_seg_head_cell_dice'
+    #monitor_metric = 'val_hv_head_hv_mae_builtin'
+    #monitor_metric = "val_loss"
     from tensorflow.keras import mixed_precision
     #mixed_precision.set_global_policy('mixed_float16')
     #Dynamic Learning rate
@@ -404,7 +428,7 @@ if __name__=="__main__":
         factor=0.5,
         patience=3,
         min_lr=1e-4,
-        mode="max",
+        mode="min",
         verbose=1
     )
 
@@ -420,14 +444,14 @@ if __name__=="__main__":
             save_best_only=True,
             save_weights_only=False,
             monitor=monitor_metric,
-            mode="max",
+            mode="min",
             verbose=1
         )
 
         # EarlyStopping
     earlystop_cb = tf.keras.callbacks.EarlyStopping(
             monitor=monitor_metric,
-            mode="max",
+            mode="min",
             patience=5,
             restore_best_weights=True
         )
@@ -440,10 +464,10 @@ if __name__=="__main__":
 
     hv_batch = Yb['hv_head']
     #print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
-    """"""
+    """
     for i in range(idx,idx + 4):
         fig, axs = plt.subplots(2, 3, figsize=(6,6))
-        image = Xb[i]        # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+        image = Xb[i]       # (H, W, 3) – RGB image (non usata da GenInstanceHV)
         mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
         hv = Yb['hv_head'][i]
         body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
@@ -460,15 +484,66 @@ if __name__=="__main__":
     
         plt.tight_layout()
         plt.show()
+    """
+    from src.losses import hover_loss_fixed,bce_dice_loss,hover_loss_fixed,hv_keras_loss,hovernet_hv_loss_tf
+    
+    model = get_model_paper()
+    
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=1e-3,
+        first_decay_steps=10*len(train_gen),   # 10 epoche
+        t_mul=2.0,                                # lunghezza fase raddoppia
+        m_mul=0.8,                                # ampiezza si riduce
+        alpha=1e-5 / 1e-3                         # min_lr
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule,
+                                         weight_decay=1e-4)
+    
 
+    @tf.keras.utils.register_keras_serializable()
+    def hv_mae_builtin(y_true, y_pred):
+        # MAE mascherata sui primi 2 canali (HV)
+        hv_t = tf.cast(y_true[..., :2], tf.float32)
+        hv_p = tf.cast(y_pred,          tf.float32)
+        mask = tf.cast(y_true[...,  2], tf.float32)    # (B,H,W)
+
+        # per-pixel MAE sui 2 canali
+        per_pix = tf.reduce_mean(tf.square(hv_t - hv_p), axis=-1)      # (B,H,W)
+        return tf.reduce_sum(per_pix * mask) / (tf.reduce_sum(mask) + 1e-8)
+    
+    model.compile(
+    optimizer=optimizer,
+    run_eagerly=True,
+    loss={
+        'seg_head': bce_dice_loss,
+        'hv_head': hover_loss_fixed#HoVerHVLoss(lambda_mse=3.0, lambda_grad=1.0, kernel_size=5)  # <--- funzione non parametrica
+    },
+    loss_weights={
+        'seg_head': 1.0,
+        'hv_head': 0.1
+    },
+    metrics={'seg_head': [CellDice()],
+             'hv_head' : []}
+)
+    print(len(model.trainable_weights))
+    h1 = model.fit(train_gen,
+                        validation_data=val_gen,
+                        epochs=10,
+                        callbacks=[
+                            earlystop_cb,
+                            checkpoint_cb,
+                            tensorboard_cb,
+                        ],
+                        verbose=1
+                        )
+    """
     from src.model import build_unet_resnet50
-    from src.losses import bce_dice_loss,hover_loss_fixed,hover_loss,hovernet_hv_loss_tf
 
     model, base = build_unet_resnet50()
 
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=1e-3,
-        first_decay_steps=25,   # 10 epoche
+        first_decay_steps=10*len(train_gen),   # 10 epoche
         t_mul=2.0,                                # lunghezza fase raddoppia
         m_mul=0.8,                                # ampiezza si riduce
         alpha=1e-5 / 1e-3                         # min_lr
@@ -481,16 +556,16 @@ if __name__=="__main__":
     optimizer=optimizer,
     loss={
         'seg_head': bce_dice_loss,
-        'hv_head': hovernet_hv_loss_tf  # <--- funzione non parametrica
+        'hv_head': hv_keras_loss  # <--- funzione non parametrica
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 1.0
+        'hv_head': 1.5
     },
     metrics={'seg_head': [CellDice()],
-             'hv_head' : [hv_mse_metric]}
+             'hv_head' : []}
 )
-    
+    print(len(model.trainable_weights))
     h1 = model.fit(train_gen,
                         validation_data=val_gen,
                         epochs=50,
@@ -501,9 +576,9 @@ if __name__=="__main__":
                         ],
                         verbose=1
                         )
-    
-    for L in model.layers:
-        if 'conv5' in L.name: L.trainable = True
+
+    for L in model.layers[int(0.25*len(model.layers)):]:
+        L.trainable = True
 
     opt = tf.keras.optimizers.SGD(learning_rate=3e-4, 
                                   momentum=0.9,
@@ -513,13 +588,14 @@ if __name__=="__main__":
     
     model.compile(optimizer=opt,
                   loss={'seg_head': bce_dice_loss,
-                        'hv_head': hovernet_hv_loss_tf},
+                        'hv_head': hv_keras_loss},
                   loss_weights={'seg_head': 1.0,
                                  'hv_head': 1.5}
                                  )
     
     checkpoint_path='models/checkpoints/neo/model_BB_RGB2_second.keras'
         # Checkpoint
+    monitor_metric = 'val_seg_head_cell_dice'
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
             save_best_only=True,
@@ -528,10 +604,10 @@ if __name__=="__main__":
             mode="max",
             verbose=1
         )
-
+    print(len(model.trainable_weights))
     h2 = model.fit(train_gen, 
               validation_data=val_gen, 
-              epochs=8,
+              epochs=20,
               callbacks=[
                 earlystop_cb,
                 checkpoint_cb,
@@ -539,9 +615,10 @@ if __name__=="__main__":
                         ],
               verbose=1
                          )
-
+    
     # tutto il backbone
-    for L in model.layers: L.trainable = True
+    for L in model.layers: 
+        L.trainable = True
 
     opt = tf.keras.optimizers.SGD(learning_rate=1e-4, 
                                   momentum=0.9,
@@ -551,19 +628,20 @@ if __name__=="__main__":
     
     model.compile(optimizer=opt,
                   loss={'seg_head': bce_dice_loss,
-                        'hv_head': hovernet_hv_loss_tf},
+                        'hv_head': hv_keras_loss},
                   loss_weights={'seg_head': 1.0,
                                  'hv_head': 2.0}
                                  )
-    
+    print(len(model.trainable_weights))
     checkpoint_path='models/checkpoints/neo/model_BB_RGB2_third.keras'
         # Checkpoint
+    monitor_metric = "val_loss"
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
             save_best_only=True,
             save_weights_only=False,
             monitor=monitor_metric,
-            mode="max",
+            mode="min",
             verbose=1
         )
 
@@ -576,6 +654,8 @@ if __name__=="__main__":
                 tensorboard_cb,
             ],
             verbose=1)
+    #OVERFITTING ?
+
 
 #OVERFITTING ?
 histories = [h1.history, h2.history, h3.history]
@@ -599,5 +679,4 @@ plt.axvline(n1+0.5, ls='--', alpha=0.5, label='Phase boundary')
 plt.axvline(n1+n2+0.5, ls='--', alpha=0.5)
 plt.xlabel('Epoch (cumulative)'); plt.ylabel('Loss'); plt.title('Unified loss')
 plt.legend(); plt.tight_layout(); plt.show()
-    
-    
+"""

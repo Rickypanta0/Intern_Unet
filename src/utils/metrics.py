@@ -1,6 +1,4 @@
 import numpy as np
-import torch
-import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 #Tutte le metriche prese da https://arxiv.org/pdf/1812.06499#page=16.19

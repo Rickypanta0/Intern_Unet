@@ -58,7 +58,7 @@ Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
 # Preprocess input images
-X = X + 0
+X = X + 10
 X_gray = X / 255
 #X_gray = np.dot(X_gray[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
 #HESOINE EXTRACTION
@@ -104,14 +104,14 @@ class ResNetPreprocess(tf.keras.layers.Layer):
 
     def compute_output_shape(self, input_shape):
         return input_shape  # shape invariata
-from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf
-checkpoint_path='models/checkpoints/neo/model_BB_RGB2_third.keras'
+from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf,hv_keras_loss
+checkpoint_path='models/checkpoints/neo/model_RGB_n2.keras'
 
 model = load_model(
     checkpoint_path,
     custom_objects={
         "bce_dice_loss": bce_dice_loss,
-        "hover_loss_fixed": hovernet_hv_loss_tf,
+        "hover_loss_fixed": hv_keras_loss,
     },
     compile=False,
     safe_mode=False                   # ← evita la ricompilazione automatica
@@ -123,12 +123,13 @@ model = load_model(
 
 model.compile(
     optimizer=tf.keras.optimizers.Adam(1e-3),
-    loss={"seg_head": bce_dice_loss, "hv_head": hovernet_hv_loss_tf},
+    loss={"seg_head": bce_dice_loss, "hv_head": hv_keras_loss},
     loss_weights={"seg_head": 1.0, "hv_head": 2.0},
 )
+
 from tensorflow.keras.applications.resnet import preprocess_input
 X_val = X_val.astype(np.float32)
-preds = model.predict(preprocess_input(X_val*255), batch_size=4)
+preds = model.predict(X_val, batch_size=8)
 seg_val_preds = preds['seg_head']
 hv_val_preds  = preds['hv_head']  # (batch, H, W, 2)
 #VISUAL CHECK

@@ -2,7 +2,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf
+from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf,hv_keras_loss
 from tensorflow.keras.models import load_model
 import tensorflow as tf
 from skimage.color import rgb2hed, hed2rgb
@@ -10,6 +10,7 @@ from tqdm import tqdm
 from matplotlib.cm import get_cmap
 from src.utils.metrics import get_fast_dice_2, get_fast_aji,get_fast_pq
 import pandas as pd
+from sklearn.model_selection import train_test_split
 import gc
 from keras import backend as K
 from tensorflow.keras.applications.resnet import preprocess_input
@@ -67,24 +68,22 @@ def HE_deconv(img):
     
     return ihc_h, ihc_e, ihc_d 
 
-def loadmodel(checkpoint_path, weight_seg_head=1.0, weight_hv_head=1.0):
+def loadmodel(checkpoint_path, weight_seg_head=0.25, weight_hv_head=1.0):
     model = load_model(
         checkpoint_path,
         custom_objects={
             "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
-            "HVLoss": hovernet_hv_loss_tf
+            "HVLoss": hv_keras_loss
         },
         compile=False                    # ← evita la ricompilazione automatica
     )
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss={"seg_head": bce_dice_loss, "hv_head": hovernet_hv_loss_tf},
+        loss={"seg_head": bce_dice_loss, "hv_head": hv_keras_loss},
         loss_weights={"seg_head": weight_seg_head, "hv_head": weight_hv_head},
     )
     return model
-from torchmetrics.classification import JaccardIndex
-import torch
 
 from tensorflow.keras.metrics import F1Score, IoU
 def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
@@ -184,10 +183,12 @@ def hema_rgb( img_rgb01):  # img in [0,1]
 from tensorflow.keras.applications.resnet import preprocess_input
 def pre_proces(checkpoint, X, weight_hv_head=2.0):
     if 'RGB' in checkpoint:
+        print("SSSSS")
         X_ = []
         for f in X:
-            img_prep = preprocess_input(f)
-            X_.append(img_prep)
+            f_ = (f+5)/255
+            #f_ = preprocess_input(f)
+            X_.append(f_)
         X = np.stack(X_, axis=0)
     elif 'HE' in checkpoint:
         X = X / 255.0
@@ -291,6 +292,32 @@ from dataclasses import dataclass
 from typing import Dict, Literal, Optional
 from scipy import stats as st
 
+def tune_params(X_val, Y_val, HV_val, seg_val, hv_val,
+                t_fg_grid, min_area_grid):
+    best = (1e9, 1e9)  # (MAE, sMAPE)
+    best_params = None
+    for t_fg in tqdm(t_fg_grid):
+        for min_area in min_area_grid:
+            abs_err = []
+            smape   = []
+            for i in range(len(X_val)):
+                P  = seg_val[i]
+                prob_pred = ((P[...,0]+P[...,2]) > P[...,1]).astype(np.float32)
+                pred_stack = np.stack([prob_pred, hv_val[i, ..., 0], hv_val[i, ..., 1]], axis=-1)
+                Lp = __proc_np_hv(pred_stack, GT=False, trhld=t_fg, min_area=min_area)
+                n_pred = int(Lp.max())
+                prob_gt = Y_val[i]
+                pred_gt = np.stack([prob_gt.squeeze(), HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
+                Lg = __proc_np_hv(pred_gt, GT=True, trhld=0.45, min_area=min_area)
+                n_gt = int(Lg.max())
+                abs_err.append(abs(n_pred - n_gt))
+                smape.append(2*abs(n_pred-n_gt)/(n_pred+n_gt+1e-6))
+            mae = float(np.mean(abs_err))
+            sm = float(np.mean(smape))
+            if (mae, sm) < best:
+                best = (mae, sm)
+                best_params = (t_fg, min_area, mae, sm)
+    return best_params
 
 @dataclass
 class BiasTestResult:
@@ -395,12 +422,6 @@ X = np.concatenate(imgs_list, axis=0)
 Y = np.concatenate(masks_list, axis=0)
 HV = np.concatenate(dmaps_list, axis=0)
 
-print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
-print("per-channel min/max:",
-      HV[...,0].min(), HV[...,0].max(),
-      HV[...,1].min(), HV[...,1].max())
-print("channels equal? mean|x-y| =", np.mean(np.abs(HV[...,0]-HV[...,1])))
-
 # Preprocess input images
 
 k = min(4, X.shape[0])                                 # quante immagini mostrare
@@ -410,7 +431,7 @@ idx = np.random.randint(0, high)
 
 checkpoint_Blu='models/checkpoints/neo/model_BB_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB2_third.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB2.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
 checkpoint_paths=[checkpoint_RGB]
@@ -418,14 +439,24 @@ checkpoint_paths=[checkpoint_RGB]
 #model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
 preds, X = pre_proces(checkpoint_RGB, X)
+
+print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
+print("GT per-channel min/max:",
+      HV[...,0].min(), HV[...,0].max(),
+      HV[...,1].min(), HV[...,1].max())
+print("channels equal? mean|x-y| =", np.mean(np.abs(HV[...,0]-HV[...,1])))
+
+seg_val_preds = preds['seg_head']
+hv_val_preds  = preds['hv_head']
+print("pred per-channel min/max:",
+      hv_val_preds[...,0].min(), hv_val_preds[...,0].max(),
+      hv_val_preds[...,1].min(), hv_val_preds[...,1].max())
 k = min(4, X.shape[0])                                 # quante immagini mostrare
 high = max(1, X.shape[0] - (k - 1))                    # ultimo indice di partenza valido + 1
 idx = np.random.randint(0, high)    
 
-#print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
-""""""
 from matplotlib.colors import hsv_to_rgb
-for i in range(idx,idx + 4):
+for i in range(idx,idx + 5):
     fig, axs = plt.subplots(2, 3, figsize=(6,6))
     image = X[i]          # (H, W, 3) – RGB image (non usata da GenInstanceHV)
     mask_3ch = Y[i]       # (H, W, 3) – bodycell, background, bordercell
@@ -445,21 +476,36 @@ for i in range(idx,idx + 4):
     sat = np.ones_like(val)                  # saturazione piena
     hsv = np.stack([hue, sat, val], axis=-1)
     rgb = hsv_to_rgb(hsv).astype(np.float32)
+
     body, bg, border = tf.unstack(mask_3chp, axis=-1)
     Cp = tf.cast(body + border > bg, tf.float32)
-    axs[0,0].imshow(X[i])                         # immagine normalizzata [0,1]
-    axs[0,1].imshow(Cp, cmap='gray')  # body
-    axs[0,2].imshow(hx)  # background
-    axs[1,0].imshow(mask_3ch, cmap='gray')  # border
+    axs[0,0].imshow(Cp, cmap='gray')                         # immagine normalizzata [0,1]
+    axs[0,1].imshow(hx)  # body
+    axs[0,2].imshow(hy)  # background
+    axs[1,0].imshow(Y[i], cmap='gray')  # border
     axs[1,1].imshow(hv[...,0])  # body
     axs[1,2].imshow(hv[...,1])  # background
 
     plt.tight_layout()
     plt.show()
 
-N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=0.37, min_area=20)
+t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
+#t_seed_grid  = [0.55, 0.60, 0.65]
+min_area_grid= [10, 20, 30]
 
-v, v_ = score_testSet(preds, Y, HV, X, trhld=0.37, min_area=20)
+X_val, _, Y_val, _, HV_val, _ = train_test_split(
+    X, Y, HV, test_size=0.1, random_state=SEED
+)
+
+best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+best_trshld = best[0]
+best_min_area = best[1]
+print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+
+
+N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
+
+v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
 print(v,v_)
 print(f"checkpoint: {checkpoint_RGB}\n")

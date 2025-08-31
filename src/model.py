@@ -5,7 +5,7 @@ Definizione dell'architettura U-Net e compilazione del modello mantenendo lo sti
 import tensorflow as tf
 from keras.metrics import MeanIoU
 #from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
-from src.losses import bce_dice_loss,hover_loss_fixed
+from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf
 from tensorflow.keras.utils import register_keras_serializable
 
 @register_keras_serializable()
@@ -117,6 +117,7 @@ class OneHotMeanIoU(tf.keras.metrics.MeanIoU):
         y_pred = tf.argmax(y_pred, axis=-1)
         # poi chiamo la classe base
         return super().update_state(y_true, y_pred, sample_weight)
+
 def get_model_paper(input_shape=(256, 256, 3)):
     """
     Costruisce e compila il modello U-Net con architettura hardcoded.
@@ -236,39 +237,17 @@ def get_model_paper(input_shape=(256, 256, 3)):
     c12_hv = tf.keras.layers.Dropout(0.05)(c12_hv)
     c12_hv = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(c12_hv)
     c12_hv = tf.keras.layers.Conv2D(16, (1, 1), kernel_initializer='he_normal', padding='same')(c12_hv)
-
     hv_head = tf.keras.layers.Conv2D(filters=2, kernel_size=(1, 1), activation='linear', name='hv_head')(c12_hv)
+
+    #hv_head = tf.keras.layers.Conv2D(filters=2, kernel_size=(1, 1), activation='tanh', name='hv_head')(c12_hv)
 
     model = tf.keras.Model(inputs=inputs, outputs={
     'seg_head': seg_head,
     'hv_head': hv_head
     })
-
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=1e-3,
-        first_decay_steps=25,   # 10 epoche
-        t_mul=2.0,                                # lunghezza fase raddoppia
-        m_mul=0.8,                                # ampiezza si riduce
-        alpha=1e-5 / 1e-3                         # min_lr
-    )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-    model.compile(
-    optimizer=optimizer,
-    loss={
-        'seg_head': bce_dice_loss,
-        'hv_head': hover_loss_fixed  # <--- funzione non parametrica
-    },
-    loss_weights={
-        'seg_head': 1.0,
-        'hv_head': 2.0
-    },
-    metrics={'seg_head': [CellDice()],
-             'hv_head' : [tf.keras.metrics.MeanSquaredError()]}
-)
     
     return model
-
+"""
 from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.layers import UpSampling2D, concatenate, Conv2D, BatchNormalization, Activation, Dropout
 from tensorflow.keras.models import Model
@@ -284,7 +263,6 @@ def CBR(x, f, k=3, dr=None):
     x = Conv2D(f, k, padding='same', use_bias=False, kernel_initializer='he_normal')(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
-    if dr: x = Dropout(dr)(x)
     return x
 
 def build_unet_resnet50(input_shape=(256,256,3), freeze_encoder=True):
@@ -301,8 +279,9 @@ def build_unet_resnet50(input_shape=(256,256,3), freeze_encoder=True):
                                           )
 
     if freeze_encoder:
-        for L in base.layers: L.trainable = False
-
+        for L in base.layers: 
+            L.trainable = False
+    
     # Skip dal ResNet
     s1 = base.get_layer('conv1_relu').output          # 128x128
     s2 = base.get_layer('conv2_block3_out').output    # 64x64
@@ -334,7 +313,7 @@ def build_unet_resnet50(input_shape=(256,256,3), freeze_encoder=True):
 
     c12_hv = Conv2D(16, 1, padding='same', kernel_initializer='he_normal')(c11)
     c12_hv = Dropout(0.05)(c12_hv); c12_hv = CBR(c12_hv, 16)
-    hv_head = Conv2D(2, 1, activation='linear', name='hv_head')(c12_hv)
+    hv_head = tf.keras.layers.Conv2D(2, 1, activation='tanh', name='hv_head')(c12_hv)
 
     return Model(inp, {'seg_head': seg_head, 'hv_head': hv_head}), base
 
@@ -343,3 +322,4 @@ if __name__ == "__main__":
     # Test e summary
     unet_model = get_model()
     unet_model.summary()
+"""

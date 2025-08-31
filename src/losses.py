@@ -5,48 +5,69 @@ Moduli per le funzioni di perdita custom:
 - BCE + Dice Loss
 - Weighted BCE + Dice Loss
 - CSCA Binary Loss (composita)
-"""
+
 import tensorflow as tf
 from tensorflow.keras.losses import BinaryCrossentropy, MeanSquaredError
 from tensorflow.keras import backend as K
 from tensorflow.keras.saving import register_keras_serializable
-import tensorflow as tf
 import numpy as np
-
-from tensorflow.keras import backend as K
-from keras.saving import register_keras_serializable
 
 @register_keras_serializable()
 def hover_loss_fixed(y_true, y_pred):
-    return hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0)(y_true, y_pred)#Oppure mettere direttamete 4.0
+    y_true_ = y_true[:, :, :, :2]
+    focus = y_true[:, :, :, 2]
+    return hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0)(y_true_, y_pred, focus)
 
 @register_keras_serializable()
 def hover_mse_grad_loss(lambda_h1=1.0, lambda_h2=2.0):
+    """
+    Loss per la testa HV: combina MSE (L2) e gradient loss.
+    """
+    def gradient_x_(img):
+        # dx (secondo TF: sobel[..., 0,1] = ∂x)
+        sob = tf.image.sobel_edges(img)  # (B,H,W,2,C) con ordine [dy, dx]
+        return sob[..., 0, 1]          # tieni la dimensione canale
     
-    #Loss per la testa HV: combina MSE (L2) e gradient loss.
+    def gradient_y_(img):
+#       # dy (sobel[..., 1,0] = ∂y)
+        sob = tf.image.sobel_edges(img)
+        return sob[..., 1, 0]
     
     def gradient_x(img):
         return img[:, :, 1:, :] - img[:, :, :-1, :]
 
     def gradient_y(img):
         return img[:, 1:, :, :] - img[:, :-1, :, :]
-
-    def loss(y_true, y_pred):
+    
+    def loss(y_true, y_pred, focus):
         # MSE loss (LH1)
         mse_loss = K.mean(K.square(y_true - y_pred))
-
         # Gradient loss (LH2)
         gx_true = gradient_x(y_true)
         gx_pred = gradient_x(y_pred)
         gy_true = gradient_y(y_true)
         gy_pred = gradient_y(y_pred)
+        #\gy_true_ = gradient_y_(hv_t_s)
+        #\gx_true_ = gradient_x_(hv_t_s)
+        #\#print(gx_true.shape,gx_true.shape,gy_pred.shape, gy_true.shape )
+        #\fig, axs = plt.subplots(2,2,figsize=(8,8))
+        #\axs[0,0].imshow(gx_true[0,...,0])
+        #\axs[0,1].imshow(gy_true[0,...,0])
+        #\axs[1,0].imshow(gx_true_[0])
+        #\axs[1,1].imshow(gy_true_[0])
+        #\plt.show()
 
+        focus = tf.expand_dims(focus, axis=-1)
+        focus = tf.concat([focus, focus], axis=-1)
         grad_loss_x = K.mean(K.square(gx_pred - gx_true))
         grad_loss_y = K.mean(K.square(gy_pred - gy_true))
+        #grad_loss_x = K.sum(K.square(gx_pred - gx_true)*focus)/K.sum(focus+ 1e-8)
+        #grad_loss_y = K.sum(K.square(gy_pred - gy_true)*focus)/K.sum(focus+ 1e-8)
+
         grad_loss = grad_loss_x + grad_loss_y
-
+        print(mse_loss,grad_loss)
         return lambda_h1 * mse_loss + lambda_h2 * grad_loss
-
+    
     return loss
 
 dice_loss_fn = tf.keras.losses.Dice(
@@ -87,58 +108,7 @@ def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.T
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return 1.0 - (2.0 * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
-
-
-def sobel_xy(t):
-    # t: (B,H,W,2) -> applico sobel a ciascun canale, poi concateno
-    # Sobel app standard via tf.image.sobel_edges (ritorna [..., 2, 2]: dy, dx)
-    # Qui estraggo dx,dy e li concateno per i 2 canali HV.
-    se = tf.image.sobel_edges(t)          # (B,H,W,2,2)
-    dy = se[..., 0]                       # (B,H,W,2)
-    dx = se[..., 1]                       # (B,H,W,2)
-    return dx, dy
-
-@tf.keras.utils.register_keras_serializable()
-def hover_loss(y_true, y_pred):
-    """
-    y_true: (B,H,W,3) con [HVx_true, HVy_true, mask_fg]  oppure
-            (B,H,W,2) con HV e mask_fg separata altrove: adatta di conseguenza.
-    y_pred: (B,H,W,2) con [HVx_pred, HVy_pred]
-    """
-    # separa HV_true e mask_fg
-    if y_true.shape[-1] == 3:
-        hv_t   = y_true['hv_head']
-        body, bg, border = tf.unstack(y_true['seg_head'], axis=-1)
-        mask_fg = tf.cast(body + border > bg, tf.float32)
-        #mask_fg = y_true[..., 2:3]     # (B,H,W,1), 1 nei nuclei, 0 altrove
-    else:
-        hv_t   = y_true
-        # SE non hai mask in y_true, metti tutto a 1 (meno consigliato)
-        mask_fg = tf.ones_like(hv_t[..., :1])
-
-    hv_p = y_pred['hv_head']
-
-    # Huber sui valori HV (masked)
-    huber = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
-    map_loss = huber(hv_t, hv_p)                     # (B,H,W,2)
-    map_loss = tf.reduce_sum(map_loss * mask_fg) / (tf.reduce_sum(mask_fg) + 1e-6)
-
-    # Gradiente (Sobel) su HV
-    dx_p, dy_p = sobel_xy(hv_p)
-    dx_t, dy_t = sobel_xy(hv_t)
-
-    grad_loss = huber(dx_t, dx_p) + huber(dy_t, dy_p)   # (B,H,W,2)
-    # peso extra su edge: approx = grad della mask_fg
-    edge = tf.image.sobel_edges(mask_fg)[...,0]**2 + tf.image.sobel_edges(mask_fg)[...,1]**2
-    edge = tf.reduce_sum(edge, axis=-1, keepdims=True)    # (B,H,W,1)
-    edge = edge / (tf.reduce_max(edge) + 1e-6)
-    w = 0.5*mask_fg + 0.5*edge                            # metà fg, metà edge
-
-    grad_loss = tf.reduce_sum(grad_loss * w) / (tf.reduce_sum(w) + 1e-6)
-
-    # pesi come nel paper/implementazioni comuni
-    return map_loss + 2.0 * grad_loss
-
+import matplotlib.pyplot as plt
 @tf.keras.utils.register_keras_serializable()
 def hovernet_hv_loss_tf(y_true, y_pred,
                         lambda_hv_mse=2.0,
@@ -148,11 +118,27 @@ def hovernet_hv_loss_tf(y_true, y_pred,
     y_pred: (B,H,W,2) -> [HVx_pred, HVy_pred]
     focus_mask: 1 sui nuclei (body|border), 0 sul background
     """
-    print(y_pred)
     # separa target e mask
     hv_t   = tf.cast(y_true[..., :2], tf.float32)   # (B,H,W,2)
     focus  = tf.cast(y_true[..., 2:3], tf.float32)  # (B,H,W,1) 0/1
     hv_p   = tf.cast(y_pred, tf.float32)            # (B,H,W,2)
+    
+    #arr = hv_t._numpy()
+    #arr1 = focus._numpy()
+    #fig, axs = plt.subplots(1,3,figsize=(8,8))
+    #axs[0].imshow(arr[0,...,0])
+    #axs[1].imshow(arr[0,...,1])
+    #axs[2].imshow(arr1[0,...,0])
+    #plt.show()
+    #
+    #arr2 = hv_p._numpy()
+    #print(arr.shape,arr1.shape, arr2.shape)
+    #for f in range(arr2.shape[0]):
+    #    fig, axs = plt.subplots(1,3,figsize=(8,8))
+    #    axs[0].imshow(arr2[f,...,0])
+    #    axs[1].imshow(arr2[f,...,1])
+    #    axs[2].imshow(arr[f,...,1])
+    #    plt.show()
 
     # ---------- 1) MSE HV (mascherata) ----------
     mse_map = tf.square(hv_p - hv_t)                        # (B,H,W,2)
@@ -179,3 +165,70 @@ def hovernet_hv_loss_tf(y_true, y_pred,
     loss_grad = grad_se / denom
 
     return lambda_hv_mse * loss_mse + lambda_hv_mse_grad * loss_grad
+
+EPS = tf.constant(1e-6, tf.float32)
+def _compute_sobel(y):
+    sobel = tf.image.sobel_edges(y)
+    sobel_y = sobel[:, :, :, 1, 0] # sobel in y-direction
+    sobel_x = sobel[:, :, :, 0, 1] # sobel in x-direction
+
+    return tf.stack([sobel_x, sobel_y], axis=-1)
+
+def mse_gradient_loss(hv_p,
+                      hv_t,
+                      focus, 
+                      lambda_dir=0.3, 
+                      lambda_center=0.1, 
+                      tau_center=0.05):
+    grad_pred = _compute_sobel(hv_p)
+    grad_true = _compute_sobel(hv_t)
+    #print(f"grad_pred {grad_pred.shape}")
+    
+    #loss = tf.subtract(grad_true, grad_pred)  # broadcasting sicuro
+    loss_grad = grad_true - grad_pred
+    #print(f"loss_grad: {tf.square(loss_grad)}")
+    
+    focus = tf.expand_dims(focus, axis=-1)     #(None, 256,256) -> (None, 256,256,1)
+    #fig, axs = plt.subplots(2,3,figsize=(8,8))
+    #axs[0,0].imshow(hv_p[0,...,0])
+    #axs[0,1].imshow(grad_pred[0,...,0])
+    #axs[0,2].imshow(loss_grad[0,...,0])
+    #axs[1,0].imshow(hv_p[0,...,1])
+    #axs[1,1].imshow(grad_pred[0,...,1])
+    #axs[1,2].imshow(loss_grad[0,...,1])
+    #plt.show()
+    #fig, axs = plt.subplots(2,3,figsize=(8,8))
+    #axs[0,0].imshow(hv_t[0,...,0])
+    #axs[0,1].imshow(grad_true[0,...,0])
+    #axs[0,2].imshow(focus[0], cmap='gray')
+    #axs[1,0].imshow(hv_t[0,...,1])
+    #axs[1,1].imshow(grad_true[0,...,1])
+    #plt.show()
+    focus = tf.concat([focus, focus], axis=-1) #(None, 256,256,1) -> (None, 256,256,2)
+    #plt.imshow(focus)
+    #plt.show()
+    grad_loss_y = tf.square(grad_pred[...,1]-grad_true[...,1])
+    grad_loss_x = tf.square(grad_pred[...,0]-grad_true[...,0])
+    loss = tf.reduce_sum(tf.square(loss_grad)*focus) / (tf.reduce_sum(focus) + 1.0e-8)
+    #print(f"\nloss_ {loss}, reduce loss_grad {tf.reduce_sum(loss_grad)}, reduce focus {tf.reduce_sum(focus)}")
+    return loss
+import keras
+def hv_keras_loss(y_true, 
+                  y_pred,
+                  lambda_dir=0.3, 
+                  lambda_center=0.1, 
+                  tau_center=0.05, 
+                  w_pix=2.0):
+
+    hv_t = y_true[:, :, :, :2]     # (B, H, W, 2)
+    focus = y_true[:, :, :, 2]     # (B, H, W)
+        
+    mse_loss = keras.losses.mean_squared_error(hv_t, y_pred) 
+    mse_gradient = mse_gradient_loss(y_pred, hv_t, focus,
+                                 lambda_dir=lambda_dir,
+                                 lambda_center=lambda_center,
+                                 tau_center=tau_center) * w_pix
+    
+    return mse_loss + mse_gradient
+
+"""
