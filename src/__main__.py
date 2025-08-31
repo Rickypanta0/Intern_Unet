@@ -2,13 +2,388 @@
 import os
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"    # opzionale ma consigliato
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"            # meno rumore nei log
+os.environ["KERAS_BACKEND"] = "torch"
+import os
+os.environ["KERAS_BACKEND"] = "torch"  # <<— fondamentale: PRIMA di importare keras
 
+import numpy as np
+from scipy.ndimage import binary_erosion
+import matplotlib.pyplot as plt
+import math
+from matplotlib.cm import get_cmap
+import cv2
+from skimage.exposure import rescale_intensity
+
+import torch
+import keras
+from keras import ops
+from keras.utils import register_keras_serializable
+
+from src.model import get_model_paper  # deve usare keras.layers, non tf.keras
+from skimage.color import rgb2hed, hed2rgb
+from src.hv_GT_generator import build_instance_map_valuewise, GenInstanceHV
+# ------------------------------
+# Data generator (solo NumPy)
+# ------------------------------
+BACKBONE = 'resnet34'
+
+class DataGenerator(keras.utils.Sequence):
+    def __init__(self, folds, list_IDs, batch_size=1, patch_size=None,
+                 shuffle=True, augment=True, skip_empty=True):
+        self.folds = folds  # lista di triple (img_path, mask_path, hv_path)
+        self.batch_size = batch_size
+        self.patch_size = patch_size
+        self.shuffle = shuffle
+        self.augment = augment
+        self.skip_empty = skip_empty
+        self.preprocess_input = BACKBONE
+        self.list_IDs = np.asarray(list_IDs)  # global indices
+        self.ratio = 2
+
+        self.sample_map = []
+        for fold_idx, (img_path, _, _) in enumerate(folds):
+            n_samples = np.load(img_path, mmap_mode='r').shape[0]
+            for i in range(n_samples):
+                self.sample_map.append((fold_idx, i))
+
+        sample_img = np.load(folds[0][0], mmap_mode='r')[0]
+        self.default_shape = sample_img.shape
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.floor(len(self.list_IDs) / self.batch_size))
+
+    def on_epoch_end(self):
+        self.indexes = np.arange(len(self.list_IDs))
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+    def __getitem__(self, index):
+        indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
+        list_IDs_temp = [self.sample_map[k] for k in indexes]
+        return self.__data_generation(list_IDs_temp)
+
+    def _make_target_3ch(self, m2):
+        struct = np.ones((3, 3), dtype=bool)
+
+        m2_ = 1 - m2
+        body_ = binary_erosion(m2_, structure=struct).astype(np.uint8)
+        body = 1 - body_
+
+        border = (m2_ - body_).clip(0, 1).astype(np.uint8)
+        background = (1 - m2).astype(np.uint8)
+
+        return np.stack([body, background, border], axis=-1)
+
+    def hema_rgb(self, img_rgb01):  # img in [0,1]
+        ihc = rgb2hed(np.clip(img_rgb01, 0, 1))
+        H = ihc[..., 0]
+        hema_only = np.stack([H, np.zeros_like(H), np.zeros_like(H)], axis=-1)
+        img_h = hed2rgb(hema_only).astype(np.float32)  # torna in RGB
+        return np.clip(img_h, 0, 1)
+
+    def __data_generation(self, list_temp):
+        if self.patch_size is None:
+            H, W, _ = self.default_shape
+        else:
+            H = W = self.patch_size
+        C = 3
+
+        N = self.batch_size
+
+        X = np.empty((N, H, W, C), dtype=np.float32)
+        Y = np.empty((N, H, W, 3), dtype=np.float32)
+        HV = np.empty((N, H, W, 3), dtype=np.float32)
+
+        for i, (fold_idx, local_idx) in enumerate(list_temp):
+            img_path, mask_path, instance_path = self.folds[fold_idx]
+
+            img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
+            img_rgb = (img + 5) / 255.0
+
+            mask = np.load(mask_path, mmap_mode='r')[local_idx]
+            if mask.ndim == 3 and mask.shape[-1] == 1:
+                mask = np.squeeze(mask, axis=-1)
+
+            #hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
+            instance_M = np.load(instance_path, mmap_mode='r')[local_idx].astype(np.float32)
+            instance_map = build_instance_map_valuewise(instance_M)
+
+            # Augmentation (NumPy-only)
+            if self.augment:
+                if np.random.rand() < 0.5:
+                    img_rgb = np.fliplr(img_rgb)
+                    mask    = np.fliplr(mask)
+                    instance_map      = np.fliplr(instance_map)
+                    #hv[..., 0] *= -1  # inverti x
+                if np.random.rand() < 0.5:
+                    img_rgb = np.flipud(img_rgb)
+                    mask    = np.flipud(mask)
+                    instance_map      = np.flipud(instance_map)
+                    #hv[..., 1] *= -1  # inverti y
+                k = np.random.randint(4)
+                img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
+                mask    = np.rot90(mask,    k, axes=(0, 1))
+                instance_map      = np.rot90(instance_map,      k, axes=(0, 1))
+                #if   k == 1: hv = np.stack([-hv[...,1],  hv[...,0]], axis=-1)
+                #elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
+                #elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
+
+            instance_input = instance_map[..., np.newaxis]
+            gen = GenInstanceHV(crop_shape=(H, W))
+            out = gen._augment(instance_input, None)
+            hv = out[..., 1:3]
+
+            X[i]  = img_rgb
+            Y[i]  = self._make_target_3ch(mask)
+            HV[i] = np.dstack([hv, mask])
+
+        return X, {'seg_head': Y, 'hv_head': HV}
+
+
+# ------------------------------
+# Metriche (keras.ops, backend-agnostiche)
+# ------------------------------
+@register_keras_serializable()
+class CellDice(keras.metrics.Metric):
+    """F1 (Dice) su maschera cella = body ∪ border (vs background)."""
+    def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+        super().__init__(name=name, **kw)
+        self.smooth = float(smooth)
+        self.intersection = self.add_weight(name="inter", initializer="zeros", dtype="float32")
+        self.union        = self.add_weight(name="union", initializer="zeros", dtype="float32")
+
+    def _bin_mask(self, y):
+        body   = y[..., 0]
+        bg     = y[..., 1]
+        border = y[..., 2]
+        return ops.cast((body + border) > bg, "float32")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_b = self._bin_mask(y_true)
+        y_pred_b = self._bin_mask(y_pred)
+        inter = ops.sum(y_true_b * y_pred_b)
+        union = ops.sum(y_true_b) + ops.sum(y_pred_b)
+        self.intersection.assign_add(ops.cast(inter, "float32"))
+        self.union.assign_add(ops.cast(union, "float32"))
+
+    def result(self):
+        s = ops.cast(self.smooth, "float32")
+        return (2.0 * self.intersection + s) / (self.union + s)
+
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
+
+
+# ------------------------------
+# Losses (importa la tua HV Torch + BCE/Dice ops)
+# ------------------------------
+from src.losses import HVLossMonaiTorch, bce_dice_loss_ops
+# Assicurati che src/losses.py contenga:
+#  - class HVLossMonaiTorch(keras.losses.Loss) -> usa torch/monai per Sobel
+#  - def bce_dice_loss_ops(y_true, y_pred, ...) -> usa keras.ops (no tf.*)
+
+
+# ------------------------------
+# Main
+# ------------------------------
+if __name__ == "__main__":
+    # Seeds
+    SEED = 42
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    base = os.path.join('data', 'raw_neoplastic')
+    folds = [
+        (os.path.join(base, 'Fold 1', 'images', 'images.npy'),
+         os.path.join(base, 'Fold 1', 'masks',  'binary_masks.npy'),
+         os.path.join(base, 'Fold 1', 'masks',  'masks.npy')),
+        (os.path.join(base, 'Fold 2', 'images', 'images.npy'),
+         os.path.join(base, 'Fold 2', 'masks',  'binary_masks.npy'),
+         os.path.join(base, 'Fold 2', 'masks',  'masks.npy'))
+    ]
+
+    num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
+    all_IDs = np.arange(num_all)
+
+    # split 90/10
+    split = int(0.9 * num_all)
+    train_IDs = all_IDs[:split]
+    val_IDs   = all_IDs[split:]
+
+    # Generators
+    train_gen = DataGenerator(folds, train_IDs, batch_size=8, shuffle=True,  augment=True)
+    val_gen   = DataGenerator(folds, val_IDs,   batch_size=8, shuffle=False, augment=False)
+
+    monitor_metric = 'val_seg_head_cell_dice'
+    #monitor_metric = 'val_loss'
+    
+
+    # Callbacks (versione Keras 3)
+    reduce_lr_cb = keras.callbacks.ReduceLROnPlateau(
+        monitor=monitor_metric, factor=0.5, patience=3,
+        min_lr=1e-4, mode="max", verbose=1
+    )
+    # TensorBoard è opzionale; se non ti serve, commenta:
+    tensorboard_cb = keras.callbacks.TensorBoard(
+        log_dir=os.path.join('logs', 'fit'),
+        histogram_freq=1, write_images=False
+    )
+    checkpoint_path = 'models/checkpoints/neo/model_RGB_mse2_grad1_L.keras'
+    checkpoint_cb = keras.callbacks.ModelCheckpoint(
+        filepath=checkpoint_path,
+        save_best_only=True, save_weights_only=False,
+        monitor=monitor_metric, mode="max", verbose=1
+    )
+    earlystop_cb = keras.callbacks.EarlyStopping(
+        monitor=monitor_metric, mode="max", patience=5, restore_best_weights=True
+    )
+
+    # Build model (assicurati che src.model usi keras.layers)
+    model = get_model_paper()
+
+    # Optimizer (semplice e compatibile)
+    optimizer = keras.optimizers.Adam(learning_rate=1e-3, weight_decay=1e-4)
+
+    # Compile: seg_head con BCE+Dice (ops), hv_head con HV Torch
+    model.compile(
+        run_eagerly=False,
+        optimizer=optimizer,
+        loss={
+            'seg_head': bce_dice_loss_ops,
+            'hv_head' : HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5),
+        },
+        loss_weights={'seg_head': 1.0, 'hv_head': 0.5},
+        metrics={'seg_head': [CellDice()], 'hv_head': []},
+    )
+
+    # Debug shapes
+    Xb, Yb = train_gen[0]
+    
+    k = min(4, Xb.shape[0])                                 # quante immagini mostrare
+    high = max(1, Xb.shape[0] - (k - 1))                    # ultimo indice di partenza valido + 1
+    idx = np.random.randint(0, high)    
+    
+    print(Xb.shape, Yb['seg_head'].shape, Yb['hv_head'].shape)
+
+    hv_batch = Yb['hv_head']
+    #print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
+ 
+    for i in range(idx,idx + 4):
+            fig, axs = plt.subplots(2, 3, figsize=(6,6))
+            image = Xb[i]       # (H, W, 3) – RGB image (non usata da GenInstanceHV)
+            mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
+            hv = Yb['hv_head'][i]
+            body_mask = mask_3ch[..., 0].astype(np.uint8)  # binaria
+            border_mask = mask_3ch[..., 2].astype(np.uint8)
+            background = mask_3ch[..., 1].astype(np.uint8)
+
+            C = np.logical_or(body_mask, border_mask).astype(np.uint8)
+            axs[0,0].imshow(image)                         # immagine normalizzata [0,1]
+            axs[0,1].imshow(body_mask, cmap='gray')  # body
+            axs[0,2].imshow(background, cmap='gray')  # background
+            axs[1,0].imshow(border_mask, cmap='gray')  # border
+            axs[1,1].imshow(hv[...,0])  # body
+            axs[1,2].imshow(hv[...,1])  # background
+
+            plt.tight_layout()
+            plt.show()
+
+    from monai.transforms import SobelGradients
+    
+    print(Xb.shape, Yb['seg_head'].shape, Yb['hv_head'].shape)
+    class HVSobelDebugCB(keras.callbacks.Callback):
+        def __init__(self, val_gen, out_dir="logs/hv_debug", n=2):
+            self.val_gen = val_gen
+            self.n = n
+            self.out_dir = out_dir
+            os.makedirs(out_dir, exist_ok=True)
+            # MONAI Sobel (una volta sola, fuori dalla loss)
+            self.sobel_h = SobelGradients(kernel_size=3, spatial_axes=1)  # ∂x
+            self.sobel_v = SobelGradients(kernel_size=3, spatial_axes=0)  # ∂y
+
+        def on_epoch_end(self, epoch, logs=None):
+            x, y = self.val_gen[0]
+            pred = self.model.predict(x[:self.n], verbose=0)['hv_head']  # (n,H,W,2)
+            hv_t = y['hv_head'][:self.n, ...,:2]                         # (n,H,W,2)
+            focus = y['hv_head'][:self.n, ..., 2] > 0.5                  # (n,H,W)
+
+            # torch tensors per usare MONAI sobel
+            Hp = torch.from_numpy(pred[...,0])
+            Vp = torch.from_numpy(pred[...,1])
+            Ht = torch.from_numpy(hv_t[...,0])
+            Vt = torch.from_numpy(hv_t[...,1])
+
+            gh_p = self.sobel_h(Hp); gh_t = self.sobel_h(Ht)
+            gv_p = self.sobel_v(Vp); gv_t = self.sobel_v(Vt)
+
+            for i in range(self.n):
+                f = focus[i]
+                fig, axs = plt.subplots(2,3, figsize=(8,6))
+                axs[0,0].imshow(Ht[i], cmap='coolwarm'); axs[0,0].set_title("H true")
+                axs[0,1].imshow(Hp[i], cmap='coolwarm'); axs[0,1].set_title("H pred")
+                axs[0,2].imshow((Hp[i]-Ht[i])*f, cmap='coolwarm'); axs[0,2].set_title("H err (nuclei)")
+
+                axs[1,0].imshow(gh_t[i], cmap='gray'); axs[1,0].set_title("∂x H true")
+                axs[1,1].imshow(gh_p[i], cmap='gray'); axs[1,1].set_title("∂y V true")
+                axs[1,2].imshow(((gh_p[i]-gh_t[i])**2 + (gv_p[i]-gv_t[i])**2)*f, cmap='magma')
+                axs[1,2].set_title("grad err (nuclei)")
+                for ax in axs.ravel(): ax.axis('off')
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.out_dir, f"epoch{epoch:03d}_sample{i}.png"))
+                plt.close(fig)
+    # Fit
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=10,
+        callbacks=[earlystop_cb, checkpoint_cb, reduce_lr_cb,HVSobelDebugCB(val_gen)],
+        verbose=1
+    )
+    from keras.models import load_model
+
+    model = load_model(
+        checkpoint_path,
+        custom_objects={
+            "BCEDiceLoss": bce_dice_loss_ops,   # stesso nome salvato
+            "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)
+        },
+        compile=False                    # ← evita la ricompilazione automatica
+    )
+
+    model.compile(
+        optimizer= keras.optimizers.Adam(1e-3),
+        loss={"seg_head": bce_dice_loss_ops,
+               "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=4.0, ksize=5)},
+        loss_weights={"seg_head": 1.0, "hv_head": 0.2},
+    )
+    sobel_h = SobelGradients(kernel_size=3, spatial_axes=1)  # ∂x
+    sobel_v = SobelGradients(kernel_size=3, spatial_axes=0)  # ∂y
+
+    # batch piccolo dalla val
+    x, y = val_gen[0]
+    yp = model.predict(x[:2], verbose=0)['hv_head']         # (n,H,W,2)
+    yt = y['hv_head'][:2]                                   # (n,H,W,3)
+
+    Hp = torch.from_numpy(yp[...,0]); Vp = torch.from_numpy(yp[...,1])
+    Ht = torch.from_numpy(yt[...,0]); Vt = torch.from_numpy(yt[...,1])
+    focus = torch.from_numpy((y['seg_head'][:2][...,0] + y['seg_head'][:2][...,2]) > 0.5)  # body∪border
+
+    gx_t = sobel_h(Ht); gy_t = sobel_v(Vt)
+    gx_p = sobel_h(Hp); gy_p = sobel_v(Vp)
+
+    # medie assolute dentro ai nuclei
+    m_true = ((gx_t.abs() + gy_t.abs()) * focus).sum() / (focus.sum() + 1e-8)
+    m_pred = ((gx_p.abs() + gy_p.abs()) * focus).sum() / (focus.sum() + 1e-8)
+    print("⟨|∂H_true|+|∂V_true|⟩_nuclei =", float(m_true))
+    print("⟨|∂H_pred|+|∂V_pred|⟩_nuclei =", float(m_pred))
+"""
 import tensorflow as tf
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
     for gpu in gpus:
         tf.config.experimental.set_memory_growth(gpu, True)
-import tensorflow as tf
 import numpy as np
 from scipy.ndimage import binary_erosion
 import matplotlib.pyplot as plt
@@ -16,13 +391,11 @@ from src.model import get_model_paper
 import math 
 from tensorflow import keras 
 from matplotlib.cm import get_cmap
-import tensorflow_io as tfio
 #from src.test_augm import build_instance_map_valuewise, GenInstanceHV
 import cv2
 from skimage.exposure import rescale_intensity
-from tensorflow.keras.applications.resnet import preprocess_input
 BACKBONE = 'resnet34'
-
+"""
 """
     def augm(self,
          seed: tuple[int,int],
@@ -105,6 +478,7 @@ BACKBONE = 'resnet34'
 
         return xz_np, yz_np, hv_np_f
     """
+"""
 from skimage.color import rgb2hed, hed2rgb
 class DataGenerator(keras.utils.Sequence):
     def __init__(self, folds, list_IDs, batch_size=1, patch_size=None,
@@ -154,7 +528,8 @@ class DataGenerator(keras.utils.Sequence):
         background = (1 - m2).astype(np.uint8)
 
         return np.stack([body,background, border], axis=-1)
-
+    """
+"""
     def augm(self,
          seed: tuple[int,int],
          img_np: np.ndarray,
@@ -163,10 +538,10 @@ class DataGenerator(keras.utils.Sequence):
          zoom_size: int,
          IMG_SIZE: int
         ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        img_np: np.ndarray (H,W) o (H,W,1) o (H,W,3), valori [0..1] o [0..255]
-        mask_np: np.ndarray (H,W), valori {0,1}
-        """
+        
+        #img_np: np.ndarray (H,W) o (H,W,1) o (H,W,3), valori [0..1] o [0..255]
+        #mask_np: np.ndarray (H,W), valori {0,1}
+        
         if mask_np.ndim == 3 and mask_np.shape[-1] == 1:
             mask_np = mask_np[..., 0]
         # 1) Assicuriamoci di avere (H,W,1) o (H,W,3)
@@ -241,7 +616,8 @@ class DataGenerator(keras.utils.Sequence):
             raise ValueError(f"La maschera deve essere 2D dopo lo squeeze, ma ha shape {yz_np.shape}")
         
         return xz_np, yz_np, hv_np_f
-
+    """
+"""
     def hema_rgb(self, img_rgb01):  # img in [0,1]
         ihc = rgb2hed(np.clip(img_rgb01, 0, 1))
         H = ihc[..., 0]
@@ -340,13 +716,10 @@ class DataGenerator(keras.utils.Sequence):
         return X, {'seg_head': Y, 'hv_head': HV}
     
 from tensorflow.keras.utils import register_keras_serializable
-@tf.keras.utils.register_keras_serializable()
-def hv_mse_metric(y_true, y_pred):
-    # MSE non mascherata, solo sui primi 2 canali
-    return tf.reduce_mean(tf.square(tf.cast(y_pred, tf.float32) - tf.cast(y_true[..., :2], tf.float32)))
+
 @register_keras_serializable()
 class CellDice(tf.keras.metrics.Metric):
-    """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
+    #F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2).
     def __init__(self, name="cell_dice", smooth=1e-6, **kw):
         super().__init__(name=name, **kw)
         self.smooth = smooth
@@ -389,22 +762,6 @@ if __name__=="__main__":
          os.path.join(base, 'Fold 2', 'masks', 'distance.npy'))
     ]
 
-    @tf.keras.utils.register_keras_serializable()
-    def hv_grad_mse_metric(y_true, y_pred):
-        hv_t  = tf.cast(y_true[..., :2], tf.float32)
-        hv_p  = tf.cast(y_pred, tf.float32)
-        focus = tf.cast(y_true[..., 2:3], tf.float32)
-
-        se_p = tf.image.sobel_edges(hv_p)
-        se_t = tf.image.sobel_edges(hv_t)
-        grad_h_p = se_p[..., 0, 1]; grad_h_t = se_t[..., 0, 1]
-        grad_v_p = se_p[..., 1, 0]; grad_v_t = se_t[..., 1, 0]
-        grad_p = tf.stack([grad_h_p, grad_v_p], axis=-1)
-        grad_t = tf.stack([grad_h_t, grad_v_t], axis=-1)
-
-        se = tf.square(grad_p - grad_t)
-        denom = tf.reduce_sum(focus) * 2.0 + 1e-8
-        return tf.reduce_sum(se * focus) / denom
     num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
 
     all_IDs = np.arange(num_all)
@@ -420,7 +777,6 @@ if __name__=="__main__":
     monitor_metric = 'val_seg_head_cell_dice'
     #monitor_metric = 'val_hv_head_hv_mae_builtin'
     #monitor_metric = "val_loss"
-    from tensorflow.keras import mixed_precision
     #mixed_precision.set_global_policy('mixed_float16')
     #Dynamic Learning rate
     reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
@@ -465,7 +821,8 @@ if __name__=="__main__":
     hv_batch = Yb['hv_head']
     #print(f"min: {np.min(hv_batch)}, max {np.max(hv_batch)}, mean {np.mean(hv_batch)}")
     """
-    for i in range(idx,idx + 4):
+"""  
+for i in range(idx,idx + 4):
         fig, axs = plt.subplots(2, 3, figsize=(6,6))
         image = Xb[i]       # (H, W, 3) – RGB image (non usata da GenInstanceHV)
         mask_3ch = Yb['seg_head'][i]       # (H, W, 3) – bodycell, background, bordercell
@@ -484,8 +841,9 @@ if __name__=="__main__":
     
         plt.tight_layout()
         plt.show()
-    """
-    from src.losses import hover_loss_fixed,bce_dice_loss,hover_loss_fixed,hv_keras_loss,hovernet_hv_loss_tf
+"""
+"""
+    #from src.losses import hover_loss_fixed,bce_dice_loss,hover_loss_fixed,hv_keras_loss,hovernet_hv_loss_tf
     
     model = get_model_paper()
     
@@ -510,17 +868,18 @@ if __name__=="__main__":
         # per-pixel MAE sui 2 canali
         per_pix = tf.reduce_mean(tf.square(hv_t - hv_p), axis=-1)      # (B,H,W)
         return tf.reduce_sum(per_pix * mask) / (tf.reduce_sum(mask) + 1e-8)
-    
+    from src.losses import HVLossMonaiTorch,bce_dice_loss_ops
+
     model.compile(
     optimizer=optimizer,
     run_eagerly=True,
     loss={
-        'seg_head': bce_dice_loss,
-        'hv_head': hover_loss_fixed#HoVerHVLoss(lambda_mse=3.0, lambda_grad=1.0, kernel_size=5)  # <--- funzione non parametrica
+        'seg_head': bce_dice_loss_ops,
+        'hv_head': HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)#HoVerHVLoss(lambda_mse=3.0, lambda_grad=1.0, kernel_size=5)  # <--- funzione non parametrica
     },
     loss_weights={
         'seg_head': 1.0,
-        'hv_head': 0.1
+        'hv_head': 2.0
     },
     metrics={'seg_head': [CellDice()],
              'hv_head' : []}
@@ -536,7 +895,8 @@ if __name__=="__main__":
                         ],
                         verbose=1
                         )
-    """
+                        """
+"""
     from src.model import build_unet_resnet50
 
     model, base = build_unet_resnet50()

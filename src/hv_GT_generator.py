@@ -384,8 +384,8 @@ folds = [os.path.join('data', 'raw_neoplastic', 'Fold 2', 'masks', 'masks.npy'),
 
 
 
-for i in folds:
-    generate_distance_maps(i)
+#for i in folds:
+#    generate_distance_maps(i)
 """
 base = os.path.join('data','raw_neoplastic')
 fold = [os.path.join(base, 'Fold 3', 'images', 'images.npy'), 

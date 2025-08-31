@@ -1,37 +1,29 @@
 
 import os
+os.environ["KERAS_BACKEND"] = "torch" 
 import numpy as np
+from keras import ops
 import matplotlib.pyplot as plt
-from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf,hv_keras_loss
-from tensorflow.keras.models import load_model
-import tensorflow as tf
+#from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf,hv_keras_loss
+from keras.models import load_model
 from skimage.color import rgb2hed, hed2rgb
 from tqdm import tqdm
 from matplotlib.cm import get_cmap
 from src.utils.metrics import get_fast_dice_2, get_fast_aji,get_fast_pq
 import pandas as pd
 from sklearn.model_selection import train_test_split
-import gc
+import keras
+from src.losses import HVLossMonaiTorch, bce_dice_loss_ops
 from keras import backend as K
-from tensorflow.keras.applications.resnet import preprocess_input
-@tf.keras.utils.register_keras_serializable(package="preproc")
-class ResNetPreprocess(tf.keras.layers.Layer):
-    def call(self, x):
-        x = tf.cast(x, tf.float32) * 255.0
-        # RGB -> BGR
-        x = x[..., ::-1]
-        mean = tf.constant([103.939, 116.779, 123.68], dtype=tf.float32)
-        return x - mean[None, None, None, :]
-
-    def compute_output_shape(self, input_shape):
-        return input_shape  # shape invariata
-    
+from keras.utils import register_keras_serializable
+#from tensorflow.keras.applications.resnet import preprocess_input
+"""
 class DiceScore(tf.keras.metrics.Metric):
-    """
-    Dice coefficient (a.k.a. F1 per segmentazione binaria).
-    Se y_pred è una mappa di probabilità applica la soglia desiderata,
-    altrimenti accetta già tensori {0,1}.
-    """
+    
+    #Dice coefficient (a.k.a. F1 per segmentazione binaria).
+    #Se y_pred è una mappa di probabilità applica la soglia desiderata,
+    #altrimenti accetta già tensori {0,1}.
+    
     def __init__(self, threshold=0.5, name="dice", dtype=None, **kwargs):
         super().__init__(name=name, dtype=dtype, **kwargs)
         self.threshold = threshold
@@ -56,7 +48,40 @@ class DiceScore(tf.keras.metrics.Metric):
     def reset_state(self):
         self.intersection.assign(0.0)
         self.union.assign(0.0)
-    
+"""
+@register_keras_serializable()
+class CellDice(keras.metrics.Metric):
+    """F1 (Dice) su maschera cella = body ∪ border (vs background)."""
+    def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+        super().__init__(name=name, **kw)
+        self.smooth = float(smooth)
+        self.intersection = self.add_weight(name="inter", initializer="zeros", dtype="float32")
+        self.union        = self.add_weight(name="union", initializer="zeros", dtype="float32")
+
+    def _bin_mask(self, y):
+        body   = y[..., 0]
+        bg     = y[..., 1]
+        border = y[..., 2]
+        return ops.cast((body + border) > bg, "float32")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_b = self._bin_mask(y_true)
+        y_pred_b = self._bin_mask(y_pred)
+        inter = ops.sum(y_true_b * y_pred_b)
+        union = ops.sum(y_true_b) + ops.sum(y_pred_b)
+        self.intersection.assign_add(ops.cast(inter, "float32"))
+        self.union.assign_add(ops.cast(union, "float32"))
+
+    def result(self):
+        s = ops.cast(self.smooth, "float32")
+        return (2.0 * self.intersection + s) / (self.union + s)
+
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
+
+
+
 def HE_deconv(img):
     ihc_hed = rgb2hed(img)
 
@@ -72,20 +97,21 @@ def loadmodel(checkpoint_path, weight_seg_head=0.25, weight_hv_head=1.0):
     model = load_model(
         checkpoint_path,
         custom_objects={
-            "BCEDiceLoss": bce_dice_loss,   # stesso nome salvato
-            "HVLoss": hv_keras_loss
+            "BCEDiceLoss": bce_dice_loss_ops,   # stesso nome salvato
+            "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)
         },
         compile=False                    # ← evita la ricompilazione automatica
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss={"seg_head": bce_dice_loss, "hv_head": hv_keras_loss},
+        optimizer= keras.optimizers.Adam(1e-3),
+        loss={"seg_head": bce_dice_loss_ops,
+               "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)},
         loss_weights={"seg_head": weight_seg_head, "hv_head": weight_hv_head},
     )
     return model
-
-from tensorflow.keras.metrics import F1Score, IoU
+import time
+from keras.metrics import F1Score, IoU
 def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     H = 256
     W = 256
@@ -95,49 +121,71 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     seg_preds = preds['seg_head']
     hv_preds  = preds['hv_head']
 
-    f1_metric = F1Score(average='macro',threshold=0.5, name='f1')
-    iou_metric = IoU(num_classes=2, target_class_ids=[1], name='iou')
-    
+    y_pred_all = (seg_preds[..., 0] + seg_preds[..., 2] > seg_preds[..., 1])    # bool
+    y_true_all = np.squeeze(Y).astype(bool)
+
+    #f1_metric = F1Score(average='macro',threshold=0.5, name='f1')
+    #iou_metric = IoU(num_classes=2, target_class_ids=[1], name='iou')
+    tp = np.logical_and(y_true_all,  y_pred_all).sum(dtype=np.int64)
+    tn = np.logical_and(~y_true_all, ~y_pred_all).sum(dtype=np.int64)
+    fp = np.logical_and(~y_true_all,  y_pred_all).sum(dtype=np.int64)
+    fn = np.logical_and( y_true_all, ~y_pred_all).sum(dtype=np.int64)
+
+    iou_pixel = float(tp / (tp + fp + fn)) if (tp + fp + fn) else 1.0
+    f1_pos    = 2*tp / (2*tp + fp + fn) if (2*tp + fp + fn) else 1.0
+    f1_neg    = 2*tn / (2*tn + fp + fn) if (2*tn + fp + fn) else 1.0
+    f1_pixel  = float((f1_pos + f1_neg) / 2)
+
+    #t_hv = t_aji = t_pq = t_dice = t_misc = 0.0
     for i in tqdm(range(Y.shape[0])):
+        t0 = time.perf_counter()
         seg = seg_preds[i]
         hv = hv_preds[i]
         hv_t = HV[i]
-        body_prob = seg[..., 0]
-        border_prob = seg[..., 2]
-        bg_prob = seg[..., 1]
+
         #plt.subplot(1,3,1); plt.imshow(body_prob, cmap='gray'); plt.title("body")
         #plt.subplot(1,3,2); plt.imshow(border_prob, cmap='gray'); plt.title("border")
         #plt.subplot(1,3,3); plt.imshow(bg_prob, cmap='gray'); plt.title("background")
         #plt.show()
-        y_pred_bin = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.int32)
-        y_true_bin = Y[i].astype(np.int32)
 
         #plt.subplot(1,3,1); plt.imshow(Y[i], cmap='gray'); plt.title("GT")
         #plt.subplot(1,3,2); plt.imshow(y_pred_bin.reshape(Y[i].shape), cmap='gray'); plt.title("Pred")
         #plt.subplot(1,3,3); plt.imshow((Y[i].squeeze() == y_pred_bin).astype(int), cmap='gray'); plt.title("Match")
         #plt.show()
+        y_pred_bin = y_pred_all[i]                  # bool
+        y_true_bin = y_true_all[i]  
+        #iou_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
+        #f1_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
 
-        iou_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
-        f1_metric.update_state(y_true_bin.squeeze(), y_pred_bin)
-
+        #t_misc += time.perf_counter() - t0
+        
         if y_true_bin.sum() == 0 and y_pred_bin.sum() == 0:
             print("NNNNN")
             continue
-
+        
+        t0 = time.perf_counter()
+        
         pred = np.stack([y_pred_bin, hv[..., 0], hv[..., 1]], axis=-1)
         label_pred = __proc_np_hv(pred,trhld=trhld, min_area=min_area)
-
+        
         pred_GT = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
         label_true = __proc_np_hv(pred_GT, GT=True)
  
-        #print(np.unique(label_pred), np.unique(label_true))
+        #t_hv += time.perf_counter() - t0
+        #t0 = time.perf_counter()#print(np.unique(label_pred), np.unique(label_true))
         
         iou_val = get_fast_aji(label_true, label_pred, pred_GT, pred, seg, X[i])
+        #t_aji += time.perf_counter() - t0
+        
+        #t0 = time.perf_counter()
         outcome,_ = get_fast_pq(label_true, label_pred)
         f1, sq, pq = outcome
+        #t_pq += time.perf_counter() - t0
+        #t0 = time.perf_counter()
         dice_val = get_fast_dice_2(label_true, label_pred)
         #print(f"ISTANCE: IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
-
+        #t_dice += time.perf_counter() - t0
+        #print(f"HV:{t_hv:.2f}s  AJI:{t_aji:.2f}s  PQ:{t_pq:.2f}s  Dice:{t_dice:.2f}s  Misc:{t_misc:.2f}s")
         I_f1_list.append(f1)
         I_iou_list.append(iou_val)
         I_dice_list.append(dice_val)
@@ -146,10 +194,7 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     dicer = np.mean(I_dice_list)
     iour = np.mean(I_iou_list)
 
-    iou = float(iou_metric.result())
-    f1 = float(f1_metric.result())
-    
-    return [f1r, dicer, iour], [iou,f1]
+    return [f1r, dicer, iour], [iou_pixel, f1_pixel]
 
 def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     # Crea DataFrame
@@ -180,10 +225,10 @@ def hema_rgb( img_rgb01):  # img in [0,1]
         hema_only = np.stack([H, np.zeros_like(H), np.zeros_like(H)], axis=-1)
         img_h = hed2rgb(hema_only).astype(np.float32)  # torna in RGB
         return np.clip(img_h, 0, 1) 
-from tensorflow.keras.applications.resnet import preprocess_input
+
 def pre_proces(checkpoint, X, weight_hv_head=2.0):
     if 'RGB' in checkpoint:
-        print("SSSSS")
+        print("RGB - Pre processing")
         X_ = []
         for f in X:
             f_ = (f+5)/255
@@ -193,13 +238,14 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
     elif 'HE' in checkpoint:
         X = X / 255.0
         X_ = []
-        print("RRRR")
+        print("HE - Pre processing")
         for f in X:
             ihc_h = hema_rgb(f)
             #ihc_h, _, _ = HE_deconv(f)
             X_.append(ihc_h)
         X = np.stack(X_, axis=0)
     elif 'Blu' in checkpoint:
+        print("Blu - Pre processing")
         X = X / 255.0
         X_ = []
         cmap = get_cmap('Blues')
@@ -210,6 +256,7 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
             X_.append(img_rgb)
         X = np.stack(X_, axis=0)
     elif 'Gray' in checkpoint:
+        print("Gray - Pre processing")
         X = X + 15
         X = X / 255
         X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
@@ -218,7 +265,8 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         raise ValueError(f"Checkpoint non riconosciuto: {checkpoint}")
     
     model = loadmodel(checkpoint_path=checkpoint, weight_hv_head=weight_hv_head)
-    preds = model.predict(X)
+    preds = model.predict(X, batch_size=4)
+    preds['hv_head'] = np.tanh(preds['hv_head'])
     return preds, X
 
 def labels_scores(checkpoint, Y, HV):
@@ -292,31 +340,42 @@ from dataclasses import dataclass
 from typing import Dict, Literal, Optional
 from scipy import stats as st
 
-def tune_params(X_val, Y_val, HV_val, seg_val, hv_val,
-                t_fg_grid, min_area_grid):
-    best = (1e9, 1e9)  # (MAE, sMAPE)
+def tune_params(X_val, Y_val, HV_val, seg_val, hv_val, t_fg_grid, min_area_grid):
+    # 1) Precompute GT UNA VOLTA, fisso
+    n_gt_list = []
+    for i in range(len(X_val)):
+        # union body∪border dal GT (niente threshold “float”: è già one-hot)
+        gt_fg = ((Y_val[i][...,0] + Y_val[i][...,2]) > 0.5).astype(np.float32)
+        gt_stack = np.stack([gt_fg, HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
+        Lg = __proc_np_hv(gt_stack, GT=True, trhld=0.5, min_area=0)  # ← fisso!
+        n_gt_list.append(int(Lg.max()))
+
+    best = (float("inf"), float("inf"))
     best_params = None
-    for t_fg in tqdm(t_fg_grid):
+
+    for t_fg in t_fg_grid:
         for min_area in min_area_grid:
-            abs_err = []
-            smape   = []
+            abs_err, smape = [], []
             for i in range(len(X_val)):
-                P  = seg_val[i]
-                prob_pred = ((P[...,0]+P[...,2]) > P[...,1]).astype(np.float32)
-                pred_stack = np.stack([prob_pred, hv_val[i, ..., 0], hv_val[i, ..., 1]], axis=-1)
+                P = seg_val[i]  # softmax pred (H,W,3)
+                # 2) PASSA PROBABILITÀ, non binario
+                fg_prob = 1.0 - P[...,1]             # = P_body + P_border se ben calibrato
+                pred_stack = np.stack([fg_prob, hv_val[i,...,0], hv_val[i,...,1]], axis=-1)
+
+                # 3) Applica threshold SOLO alle predizioni, GT fisso
                 Lp = __proc_np_hv(pred_stack, GT=False, trhld=t_fg, min_area=min_area)
                 n_pred = int(Lp.max())
-                prob_gt = Y_val[i]
-                pred_gt = np.stack([prob_gt.squeeze(), HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
-                Lg = __proc_np_hv(pred_gt, GT=True, trhld=0.45, min_area=min_area)
-                n_gt = int(Lg.max())
+                n_gt   = n_gt_list[i]
+
                 abs_err.append(abs(n_pred - n_gt))
                 smape.append(2*abs(n_pred-n_gt)/(n_pred+n_gt+1e-6))
+
             mae = float(np.mean(abs_err))
-            sm = float(np.mean(smape))
-            if (mae, sm) < best:
+            sm  = float(np.mean(smape))
+            if (mae < best[0]) or (mae == best[0] and sm < best[1]):  # tie-break corretto
                 best = (mae, sm)
                 best_params = (t_fg, min_area, mae, sm)
+
     return best_params
 
 @dataclass
@@ -431,7 +490,7 @@ idx = np.random.randint(0, high)
 
 checkpoint_Blu='models/checkpoints/neo/model_BB_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_BB_RGB2.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_RGB_mse2_grad1_L.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
 checkpoint_paths=[checkpoint_RGB]
@@ -448,9 +507,9 @@ print("channels equal? mean|x-y| =", np.mean(np.abs(HV[...,0]-HV[...,1])))
 
 seg_val_preds = preds['seg_head']
 hv_val_preds  = preds['hv_head']
-print("pred per-channel min/max:",
-      hv_val_preds[...,0].min(), hv_val_preds[...,0].max(),
-      hv_val_preds[...,1].min(), hv_val_preds[...,1].max())
+#print("pred per-channel min/max:",
+#      hv_val_preds[...,0].min(), hv_val_preds[...,0].max(),
+#      hv_val_preds[...,1].min(), hv_val_preds[...,1].max())
 k = min(4, X.shape[0])                                 # quante immagini mostrare
 high = max(1, X.shape[0] - (k - 1))                    # ultimo indice di partenza valido + 1
 idx = np.random.randint(0, high)    
@@ -466,19 +525,11 @@ for i in range(idx,idx + 5):
     clip_pct=99
     hx = hvp[..., 0]
     hy = hvp[..., 1]
-    ang = np.arctan2(hy, hx)                 # [-pi, pi]
-    hue = (ang + np.pi) / (2*np.pi)          # [0,1] -> direzione
+    body = mask_3chp[...,0]
+    bg = mask_3chp[...,1] 
+    border = mask_3chp[...,2]
 
-    mag = np.sqrt(hx*hx + hy*hy)
-    mmax = np.percentile(mag, clip_pct) + 1e-8
-    val = np.clip(mag / mmax, 0, 1)          # [0,1] -> intensità
-
-    sat = np.ones_like(val)                  # saturazione piena
-    hsv = np.stack([hue, sat, val], axis=-1)
-    rgb = hsv_to_rgb(hsv).astype(np.float32)
-
-    body, bg, border = tf.unstack(mask_3chp, axis=-1)
-    Cp = tf.cast(body + border > bg, tf.float32)
+    Cp = ((body + border) > bg).astype(np.float32) 
     axs[0,0].imshow(Cp, cmap='gray')                         # immagine normalizzata [0,1]
     axs[0,1].imshow(hx)  # body
     axs[0,2].imshow(hy)  # background
@@ -497,11 +548,10 @@ X_val, _, Y_val, _, HV_val, _ = train_test_split(
     X, Y, HV, test_size=0.1, random_state=SEED
 )
 
-best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
-best_trshld = best[0]
-best_min_area = best[1]
-print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
-
+#best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+best_trshld = 0.45#best[0]
+best_min_area = 10#best[1]
+#print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
 
 N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 

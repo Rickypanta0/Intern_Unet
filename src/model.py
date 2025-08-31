@@ -1,16 +1,26 @@
 # src/model.py
+import os
+os.environ["KERAS_BACKEND"] = "torch"  # <<— fondamentale: prima di importare keras
+
+import keras
+from keras import layers, ops
+from keras.utils import register_keras_serializable
+
+# (opzionale) torch per le loss custom
+import torch
+import torch.nn.functional as F
 """
 Definizione dell'architettura U-Net e compilazione del modello mantenendo lo stile esplicito originale.
 """
-import tensorflow as tf
-from keras.metrics import MeanIoU
-#from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
-from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf
-from tensorflow.keras.utils import register_keras_serializable
-
+#import tensorflow as tf
+#from keras.metrics import MeanIoU
+##from src.losses import csca_binary_loss, bce_dice_loss,Lp,binary_iou,hover_mse_grad_loss,hover_loss_fixed
+#from src.losses import bce_dice_loss,hover_loss_fixed,hovernet_hv_loss_tf
+#from tensorflow.keras.utils import register_keras_serializable
+"""
 @register_keras_serializable()
 class CellDice(tf.keras.metrics.Metric):
-    """F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2)."""
+    #F1 (o Dice) su maschere cella = body ∪ border (canali 0 e 2).
     def __init__(self, name="cell_dice", smooth=1e-6, **kw):
         super().__init__(name=name, **kw)
         self.smooth = smooth
@@ -34,17 +44,159 @@ class CellDice(tf.keras.metrics.Metric):
     def reset_state(self):
         self.intersection.assign(0.0)
         self.union.assign(0.0)
+"""
+@register_keras_serializable()
+class CellDice(keras.metrics.Metric):
+    """Dice su maschera cella = body ∪ border (vs background)."""
+    def __init__(self, name="cell_dice", smooth=1e-6, **kw):
+        super().__init__(name=name, **kw)
+        self.smooth = float(smooth)
+        self.intersection = self.add_weight(name="inter", initializer="zeros", dtype="float32")
+        self.union        = self.add_weight(name="union", initializer="zeros", dtype="float32")
 
+    def _bin_mask(self, y):  # y: [...,3] = [body, bg, border]
+        body   = y[..., 0]
+        bg     = y[..., 1]
+        border = y[..., 2]
+        return ops.cast((body + border) > bg, "float32")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_b = self._bin_mask(y_true)
+        y_pred_b = self._bin_mask(y_pred)
+        inter = ops.sum(y_true_b * y_pred_b)
+        union = ops.sum(y_true_b) + ops.sum(y_pred_b)
+        # assegna valori Python/ops ai pesi
+        self.intersection.assign_add(ops.cast(inter, "float32"))
+        self.union.assign_add(ops.cast(union, "float32"))
+
+    def result(self):
+        s = ops.cast(self.smooth, "float32")
+        return (2.0 * self.intersection + s) / (self.union + s)
+
+    def reset_state(self):
+        self.intersection.assign(0.0)
+        self.union.assign(0.0)
+
+def get_model_paper(input_shape=(256, 256, 3)):
+    inputs = keras.Input(input_shape)
+
+    # Encoder
+    c1 = layers.Conv2D(32, 3, kernel_initializer="he_normal", padding="same")(inputs)
+    c1 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c1)
+    c1 = layers.Activation("relu")(c1)
+    c1 = layers.Dropout(0.1)(c1)
+    c1 = layers.Conv2D(32, 3, kernel_initializer="he_normal", padding="same")(c1)
+    c1 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c1)
+    c1 = layers.Activation("relu")(c1)
+    p1 = layers.MaxPooling2D(2)(c1)
+
+    c2 = layers.Conv2D(64, 3, kernel_initializer="he_normal", padding="same")(p1)
+    c2 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c2)
+    c2 = layers.Activation("relu")(c2)
+    c2 = layers.Dropout(0.1)(c2)
+    c2 = layers.Conv2D(64, 3, kernel_initializer="he_normal", padding="same")(c2)
+    c2 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c2)
+    c2 = layers.Activation("relu")(c2)
+    p2 = layers.MaxPooling2D(2)(c2)
+
+    c3 = layers.Conv2D(128, 3, kernel_initializer="he_normal", padding="same")(p2)
+    c3 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c3)
+    c3 = layers.Activation("relu")(c3)
+    c3 = layers.Dropout(0.2)(c3)
+    c3 = layers.Conv2D(128, 3, kernel_initializer="he_normal", padding="same")(c3)
+    c3 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c3)
+    c3 = layers.Activation("relu")(c3)
+    p3 = layers.MaxPooling2D(2)(c3)
+
+    # Bottleneck
+    c5 = layers.Conv2D(256, 3, kernel_initializer="he_normal", padding="same")(p3)
+    c5 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c5)
+    c5 = layers.Activation("relu")(c5)
+    c5 = layers.Dropout(0.3)(c5)
+    c5 = layers.Conv2D(256, 3, kernel_initializer="he_normal", padding="same")(c5)
+    c5 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c5)
+    c5 = layers.Activation("relu")(c5)
+    p5 = layers.MaxPooling2D(2)(c5)
+
+    c6 = layers.Conv2D(512, 3, kernel_initializer="he_normal", padding="same")(p5)
+    c6 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c6)
+    c6 = layers.Activation("relu")(c6)
+    c6 = layers.Dropout(0.3)(c6)
+    c6 = layers.Conv2D(512, 3, kernel_initializer="he_normal", padding="same")(c6)
+    c6 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c6)
+    c6 = layers.Activation("relu")(c6)
+    u1 = layers.UpSampling2D(size=(2,2), interpolation="nearest")(c6)
+
+    # Decoder
+    u6 = layers.Concatenate()([u1, c5])
+    c7 = layers.Conv2D(256, 3, kernel_initializer="he_normal", padding="same")(u6)
+    c7 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c7)
+    c7 = layers.Activation("relu")(c7)
+    c7 = layers.Dropout(0.2)(c7)
+    c7 = layers.Conv2D(256, 3, kernel_initializer="he_normal", padding="same")(c7)
+    c7 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c7)
+    c7 = layers.Activation("relu")(c7)
+    u2 = layers.UpSampling2D(size=(2,2), interpolation="nearest")(c7)
+
+    u7 = layers.Concatenate()([u2, c3])
+    c8 = layers.Conv2D(128, 3, kernel_initializer="he_normal", padding="same")(u7)
+    c8 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c8)
+    c8 = layers.Activation("relu")(c8)
+    c8 = layers.Dropout(0.2)(c8)
+    c8 = layers.Conv2D(128, 3, kernel_initializer="he_normal", padding="same")(c8)
+    c8 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c8)
+    c8 = layers.Activation("relu")(c8)
+    u3 = layers.UpSampling2D(size=(2,2), interpolation="nearest")(c8)
+
+    u8 = layers.Concatenate()([u3, c2])
+    c9 = layers.Conv2D(64, 3, kernel_initializer="he_normal", padding="same")(u8)
+    c9 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c9)
+    c9 = layers.Activation("relu")(c9)
+    c9 = layers.Dropout(0.05)(c9)
+    c9 = layers.Conv2D(64, 3, kernel_initializer="he_normal", padding="same")(c9)
+    c9 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c9)
+    c9 = layers.Activation("relu")(c9)
+    u4 = layers.UpSampling2D(size=(2,2), interpolation="nearest")(c9)
+
+    u9 = layers.Concatenate()([u4, c1])
+    c10 = layers.Conv2D(32, 3, kernel_initializer="he_normal", padding="same")(u9)
+    c10 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c10)
+    c10 = layers.Activation("relu")(c10)
+    c10 = layers.Dropout(0.05)(c10)
+    c10 = layers.Conv2D(32, 3, kernel_initializer="he_normal", padding="same")(c10)
+    c10 = layers.BatchNormalization(axis=-1, momentum=0.9, epsilon=1e-3)(c10)
+    c10 = layers.Activation("relu")(c10)
+
+    c11 = layers.Dropout(0.1)(c10)
+    c11 = layers.Conv2D(16, 3, kernel_initializer="he_normal", padding="same")(c11)
+    c11 = layers.Dropout(0.05)(c11)
+    c11 = layers.Conv2D(16, 3, kernel_initializer="he_normal", padding="same")(c11)
+
+    c12 = layers.Conv2D(16, 1, kernel_initializer="he_normal", padding="same")(c11)
+    c12 = layers.Dropout(0.05)(c12)
+    c12 = layers.Conv2D(16, 3, kernel_initializer="he_normal", padding="same")(c12)
+    c12 = layers.Conv2D(16, 1, kernel_initializer="he_normal", padding="same")(c12)
+
+    seg_head = layers.Conv2D(3, 1, activation="softmax", name="seg_head")(c12)
+
+    c12_hv = layers.Conv2D(16, 1, kernel_initializer="he_normal", padding="same")(c11)
+    c12_hv = layers.Dropout(0.05)(c12_hv)
+    c12_hv = layers.Conv2D(16, 3, kernel_initializer="he_normal", padding="same")(c12_hv)
+    c12_hv = layers.Conv2D(16, 1, kernel_initializer="he_normal", padding="same")(c12_hv)
+    hv_head = layers.Conv2D(2, 1, activation="linear", name="hv_head")(c12_hv)
+
+    model = keras.Model(inputs=inputs, outputs={"seg_head": seg_head, "hv_head": hv_head})
+    return model
+"""
 def get_model(input_shape=(256, 256, 3), learning_rate=1e-4):
-    """
-    Costruisce e compila il modello U-Net con architettura hardcoded.
-
-    Args:
-        input_shape: tupla shape dell'input (H, W, C)
-        learning_rate: learning rate per Adam
-    Returns:
-        modello compilato (tf.keras.Model)
-    """
+    #Costruisce e compila il modello U-Net con architettura hardcoded.
+#
+    #Args:
+    #    input_shape: tupla shape dell'input (H, W, C)
+    #    learning_rate: learning rate per Adam
+    #Returns:
+    #    modello compilato (tf.keras.Model)
+    
     inputs = tf.keras.Input(input_shape)
 
     # Encoder
@@ -119,16 +271,16 @@ class OneHotMeanIoU(tf.keras.metrics.MeanIoU):
         return super().update_state(y_true, y_pred, sample_weight)
 
 def get_model_paper(input_shape=(256, 256, 3)):
-    """
-    Costruisce e compila il modello U-Net con architettura hardcoded.
 
-    Args:
-        input_shape: tupla shape dell'input (H, W, C)
-        learning_rate: learning rate per Adam
-    Returns:
-        modello compilato (tf.keras.Model)
-    """
-    inputs = tf.keras.Input(input_shape)
+    #Costruisce e compila il modello U-Net con architettura hardcoded.
+#
+    #Args:
+    #    input_shape: tupla shape dell'input (H, W, C)
+    #    learning_rate: learning rate per Adam
+    #Returns:
+    #    modello compilato (tf.keras.Model)
+#
+    #inputs = tf.keras.Input(input_shape)
 
     # Encoder
     c1 = tf.keras.layers.Conv2D(32, (3, 3), kernel_initializer='he_normal', padding='same')(inputs)
@@ -247,6 +399,7 @@ def get_model_paper(input_shape=(256, 256, 3)):
     })
     
     return model
+"""
 """
 from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.layers import UpSampling2D, concatenate, Conv2D, BatchNormalization, Activation, Dropout
