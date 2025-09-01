@@ -127,7 +127,6 @@ def get_fast_aji(true, pred,pred_GT, pred_p,seg, x, smooth=1e-6):
         #axs[1,1].imshow(pred_p[...,1],cmap='nipy_spectral')
         #axs[1,2].imshow(seg[...,1],cmap='gray')
         #plt.show()
-        print("SSSS")
         return 0.0
     paired_pred = np.argmax(pairwise_iou, axis=1)
     pairwise_iou = np.max(pairwise_iou, axis=1)

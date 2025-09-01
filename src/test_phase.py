@@ -98,7 +98,7 @@ def loadmodel(checkpoint_path, weight_seg_head=0.25, weight_hv_head=1.0):
         checkpoint_path,
         custom_objects={
             "BCEDiceLoss": bce_dice_loss_ops,   # stesso nome salvato
-            "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)
+            "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)
         },
         compile=False                    # ← evita la ricompilazione automatica
     )
@@ -106,7 +106,7 @@ def loadmodel(checkpoint_path, weight_seg_head=0.25, weight_hv_head=1.0):
     model.compile(
         optimizer= keras.optimizers.Adam(1e-3),
         loss={"seg_head": bce_dice_loss_ops,
-               "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5)},
+               "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)},
         loss_weights={"seg_head": weight_seg_head, "hv_head": weight_hv_head},
     )
     return model
@@ -343,40 +343,133 @@ from scipy import stats as st
 def tune_params(X_val, Y_val, HV_val, seg_val, hv_val, t_fg_grid, min_area_grid):
     # 1) Precompute GT UNA VOLTA, fisso
     n_gt_list = []
+    lg_list = []
     for i in range(len(X_val)):
         # union body∪border dal GT (niente threshold “float”: è già one-hot)
-        gt_fg = ((Y_val[i][...,0] + Y_val[i][...,2]) > 0.5).astype(np.float32)
-        gt_stack = np.stack([gt_fg, HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
-        Lg = __proc_np_hv(gt_stack, GT=True, trhld=0.5, min_area=0)  # ← fisso!
+        gt_fg = Y_val[i].astype(np.float32)
+        gt_stack = np.stack([gt_fg.squeeze(), HV_val[i,...,0], HV_val[i,...,1]], axis=-1)
+        Lg = __proc_np_hv(gt_stack, GT=True)  # ← fisso!
         n_gt_list.append(int(Lg.max()))
+        lg_list.append(Lg)
 
-    best = (float("inf"), float("inf"))
+    best = (float("-inf"), float("-inf"))
     best_params = None
 
-    for t_fg in t_fg_grid:
+    for t_fg in tqdm(t_fg_grid):
         for min_area in min_area_grid:
-            abs_err, smape = [], []
+            abs_err, smape, iou_list =[], [], []
             for i in range(len(X_val)):
-                P = seg_val[i]  # softmax pred (H,W,3)
-                # 2) PASSA PROBABILITÀ, non binario
-                fg_prob = 1.0 - P[...,1]             # = P_body + P_border se ben calibrato
+
+                gt_fg = Y_val[i].astype(np.float32)
+                gt_stack = np.stack([gt_fg.squeeze(), HV_val[i,...,0], HV_val[i,...,1]], axis=-1)    
+
+                P = seg_val[i]  
+                fg_prob = ((P[...,0]+P[...,2]) > P[...,1]).astype(np.float32)             # = P_body + P_border se ben calibrato
                 pred_stack = np.stack([fg_prob, hv_val[i,...,0], hv_val[i,...,1]], axis=-1)
 
-                # 3) Applica threshold SOLO alle predizioni, GT fisso
                 Lp = __proc_np_hv(pred_stack, GT=False, trhld=t_fg, min_area=min_area)
+
                 n_pred = int(Lp.max())
                 n_gt   = n_gt_list[i]
 
+                iou_val = get_fast_aji(lg_list[i], Lp, Y[i], gt_stack, P, X_val[i])
+                iou_list.append(iou_val)
+
                 abs_err.append(abs(n_pred - n_gt))
-                smape.append(2*abs(n_pred-n_gt)/(n_pred+n_gt+1e-6))
+                #smape.append(2*abs(n_pred-n_gt)/(n_pred+n_gt+1e-6))
 
             mae = float(np.mean(abs_err))
-            sm  = float(np.mean(smape))
-            if (mae < best[0]) or (mae == best[0] and sm < best[1]):  # tie-break corretto
-                best = (mae, sm)
-                best_params = (t_fg, min_area, mae, sm)
+            iou = float(np.mean(iou_list))
+            if (iou > best[1]):  # tie-break corretto
+                best = (mae, iou)
+                best_params = (t_fg, min_area, mae, iou)
+            print(f"t_fg={t_fg:.2f}, min_area={min_area}, MAE={mae:.2f}, iou={iou:.2f}")
+            print(best_params)
 
     return best_params
+from skimage.measure import label, regionprops
+from scipy.spatial.distance import pdist
+
+def mean_min_dist(centroids):
+    if len(centroids) < 2:
+        return np.inf
+    return np.mean(pdist(centroids))
+
+def analyze_nuclei(labeled):
+    #labeled = label(mask_bin)
+    props = regionprops(labeled)
+    areas = [p.area for p in props]
+    centroids = [p.centroid for p in props]
+    num_nuclei = len(props)
+    mean_area = np.mean(areas) if areas else 0
+    return num_nuclei, mean_area, centroids
+
+def categorize_images(instance_masks):
+    all_areas = []
+    all_dists = []
+    stats = []
+
+    for i in tqdm(range(len(instance_masks))):
+        istance_mask = instance_masks[i]
+        num_nuclei, mean_area, centroids = analyze_nuclei(istance_mask)
+        mean_dist = mean_min_dist(centroids)
+        stats.append((num_nuclei, mean_area, mean_dist))
+        all_areas.append(mean_area)
+        all_dists.append(mean_dist)
+
+    area_thresh = np.median(all_areas)
+    dist_thresh = np.median(all_dists)
+
+    categories = []
+    for i, (n, a, d) in enumerate(stats):
+        area_cat = "piccoli" if a < area_thresh else "grandi"
+        density_cat = "alta" if d < dist_thresh else "bassa"
+        categories.append((area_cat, density_cat))
+    
+    return categories  # lista di tuple (area_cat, density_cat)
+
+def count_nuclei(mask_bin):
+    labeled = label(mask_bin)
+    return np.max(labeled)
+
+def test_model_on_categories(preds, HV, Y, categories, trhld, min_area):
+    from keras import backend as K
+
+    seg_preds = preds['seg_head']
+    hv_preds = preds['hv_head']
+
+    results = {
+        ("piccoli", "alta"): [],
+        ("piccoli", "bassa"): [],
+        ("grandi", "alta"): [],
+        ("grandi", "bassa"): []
+    }
+
+    for i in range(Y.shape[0]):
+        gt_fg = Y[i].astype(np.float32)
+        gt_stack = np.stack([gt_fg.squeeze(), HV[i,...,0], HV[i,...,1]], axis=-1)
+
+        n_true = __proc_np_hv(gt_stack, GT=True)
+
+        seg = seg_preds[i]
+        body_prob = seg[..., 0]
+        border_prob = seg[..., 2]
+        bg_prob = seg[..., 1]
+
+        pred_mask = ((body_prob + border_prob) > bg_prob).astype(np.uint8)
+        pred_stack = np.stack([pred_mask, hv_preds[i,...,0], hv_preds[i,...,1]], axis=-1)
+
+        n_pred = __proc_np_hv(pred_stack, GT=False, trhld=trhld, min_area=min_area)
+
+        error = abs(n_true - n_pred)
+
+        key = categories[i]
+        results[key].append(error)
+
+    # Calcola media errore per categoria
+    results_mean = {k: np.mean(v) if v else 0 for k, v in results.items()}
+
+    return results
 
 @dataclass
 class BiasTestResult:
@@ -472,7 +565,7 @@ for i, (img_path, mask_path, dist_path) in enumerate(folds):
     masks = np.load(mask_path, mmap_mode='r')
     dmaps = np.load(dist_path, mmap_mode='r')
 
-    idxs = rng.choice(len(imgs), size=N, replace=False)
+    #idxs = rng.choice(len(imgs), size=N, replace=False)
     imgs_list.append(imgs)
     masks_list.append(masks)
     dmaps_list.append(dmaps)
@@ -488,16 +581,16 @@ high = max(1, X.shape[0] - (k - 5))                    # ultimo indice di parten
 idx = np.random.randint(0, high)  
 
 
-checkpoint_Blu='models/checkpoints/neo/model_BB_Blu.keras'
+checkpoint_Blu='models/checkpoints/neo/model_Blu.keras'
 checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_RGB_mse2_grad1_L.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
-checkpoint_paths=[checkpoint_RGB]
+checkpoint_paths=[checkpoint_HE]
 #
 #model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
-preds, X = pre_proces(checkpoint_RGB, X)
+preds, X = pre_proces(checkpoint_HE, X)
 
 print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
 print("GT per-channel min/max:",
@@ -548,31 +641,142 @@ X_val, _, Y_val, _, HV_val, _ = train_test_split(
     X, Y, HV, test_size=0.1, random_state=SEED
 )
 
-#best = tune_params(X_val, Y_val, HV_val, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
-best_trshld = 0.45#best[0]
-best_min_area = 10#best[1]
-#print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+best_trshld =  best[0]
+best_min_area = best[1]
+print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
 
 N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 
 v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
 print(v,v_)
-print(f"checkpoint: {checkpoint_RGB}\n")
+print(f"checkpoint: {checkpoint_HE}\n")
 print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
 #RGB, HE, Blu, Gray Label
-L_scores_F1 = [0.6494954673267342, 0.9624335286067217, 0.9472365862827455, 0.959334461216888]
-L_scores_Dice = [0.6938941265614244, 0.962433908088167, 0.9472371079219255, 0.9593348696247608]
-L_scores_IoU = [0.5750426737055911, 0.9290504189732318, 0.9020675153832152, 0.923387367286549]
+L_scores_F1 = [0.638529049884507, 0.6217882334816339, 0.9472365862827455, 0.959334461216888]
+L_scores_Dice = [0.6069365145261811, 0.5990955220675084, 0.9472371079219255, 0.9593348696247608]
+L_scores_IoU = [0.5296632884537072, 0.5147541559041431, 0.9020675153832152, 0.923387367286549]
 
 #RGB, HE, Blu BinaryMask
-scores_F1 = [0.8431848287582397]
-scores_IoU = [0.7296468019485474]
-
-# Mostra tabella
-#print_labels_with_plot(scores_F1, scores_Dice, scores_IoU)   
+scores_F1 = [0.8700626496266222, 0.8625804271868238]
+scores_IoU = [0.655638917837067, 0.6399422174400162]
 
 res_bias = test_count_bias(N_gt, N_pred_rgb)
 
 plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
-print(res_bias)
+
+from src.hv_GT_generator import build_instance_map_valuewise
+from matplotlib.patches import Patch
+
+def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
+    labeled_path = os.path.join('data', 'raw_neoplastic','Fold 3', 'masks',  'masks.npy')
+    label_M = np.load(labeled_path, mmap_mode='r')
+    label_mask = [build_instance_map_valuewise(i) for i in label_M]
+
+    categories = categorize_images(label_mask)
+
+    # Ordine categorie (gruppi sull'asse x) e modelli (box dentro ogni gruppo)
+    order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
+    labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
+
+    # Contenitore: per ogni categoria, una lista di 4 liste (una per modello)
+    errs_by_cat = {cat: [ [] for _ in labels ] for cat in order}
+
+    def _model_label_from_ckpt(path: str) -> str:
+        if 'RGB' in path: return 'RGB'
+        if 'HE' in path or 'Hesoine' in path: return 'Hesoine'
+        if 'Blu' in path or 'Blue' in path: return 'Blu'
+        if 'Gray' in path or 'Grey' in path: return 'Gray'
+        return labels[0]  # fallback
+
+    for check in checkpoints:
+        model = load_model(
+            check,
+            custom_objects={
+                "BCEDiceLoss": bce_dice_loss_ops,
+                "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)
+            },
+            compile=False
+        )
+        model.compile(
+            optimizer=keras.optimizers.Adam(1e-3),
+            loss={"seg_head": bce_dice_loss_ops, "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)},
+            loss_weights={"seg_head": 1.0, "hv_head": 2.0},
+        )
+
+        preds = model.compile(X, batch=4)  # (lasciato invariato come richiesto)
+        results = test_model_on_categories(preds, HV, Y, categories, best_trshld, best_min_area)
+        # `results` deve essere: {("piccoli","alta"): [err_i...], ...}
+
+        mlabel = _model_label_from_ckpt(check)
+        m_idx = labels.index(mlabel)
+
+        # Accumula gli errori grezzi per categoria e modello
+        for cat in order:
+            errs_by_cat[cat][m_idx].extend(results.get(cat, []))
+
+    # Unico grafico raggruppato
+    _box_plot_grouped(errs_by_cat, labels, order)
+
+
+def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
+    # Impostazioni layout
+    n_groups  = len(cat_order)          # 4 categorie
+    n_models  = len(model_labels)       # 4 modelli
+    box_w     = 0.6
+    dx        = 0.8                     # distanza tra box nello stesso gruppo
+    gap       = 1.5                     # gap tra gruppi
+    colors    = ['red', 'violet', 'blue', 'gray']  # 'blue' (non 'blu')
+
+    # Prepara dati e posizioni
+    data = []
+    positions = []
+    group_centers = []
+
+    base = 1.0
+    for g, cat in enumerate(cat_order):
+        # posizioni delle 4 box del gruppo g
+        group_pos = [base + m*dx for m in range(n_models)]
+        positions.extend(group_pos)
+
+        # dati: per ogni modello, la lista errori (se vuota, metti NaN per evitare errori)
+        for m in range(n_models):
+            vals = errs_by_cat[cat][m]
+            data.append(vals if len(vals) else [np.nan])
+
+        # centro gruppo per xtick
+        group_centers.append(np.mean(group_pos))
+        # avanza base al prossimo gruppo
+        base += n_models*dx + gap
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bplots = ax.boxplot(
+        data,
+        positions=positions,
+        widths=box_w,
+        patch_artist=True,
+        manage_ticks=False
+    )
+
+    # Colora le box per modello (ripetendo il pattern colori)
+    for i, patch in enumerate(bplots['boxes']):
+        m = i % n_models
+        patch.set_facecolor(colors[m])
+        patch.set_alpha(0.8)
+
+    # Asse x: nomi categorie
+    ax.set_xticks(group_centers)
+    ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order])
+    ax.set_ylabel("Errore di conteggio")
+    ax.set_title("Errore di conteggio per categoria (boxplot raggruppato)")
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+    # Legenda modelli
+    legend_patches = [Patch(facecolor=colors[m], label=model_labels[m]) for m in range(n_models)]
+    ax.legend(handles=legend_patches, title="Modello", loc="upper right")
+
+    plt.tight_layout()
+    plt.show()
+#for k, err in results.items():
+#    print(f"{k[0]} nuclei - {k[1]} densità → errore medio: {err:.2f}")

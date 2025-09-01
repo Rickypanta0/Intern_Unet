@@ -98,8 +98,29 @@ class DataGenerator(keras.utils.Sequence):
         for i, (fold_idx, local_idx) in enumerate(list_temp):
             img_path, mask_path, instance_path = self.folds[fold_idx]
 
-            img = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img + 5) / 255.0
+            img_rgb = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
+            img_rgb = (img_rgb +15) / 255.0
+            
+            #HESOINE EXTRACTION
+            
+            #ihc_hed = rgb2hed(img_rgb)
+#
+            ## Create an RGB image for each of the stains
+            #null = np.zeros_like(ihc_hed[:, :, 0])
+            #img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
+            #img_rgb = self.hema_rgb(img_rgb)
+
+            #BLU CHANNEL
+            
+            blu = img_rgb[...,2]
+            blu_enhanced = np.clip(blu + 0.05, 0, 1)
+            cmap = get_cmap('Blues')
+            img_rgb = cmap(blu_enhanced)[:, :, :3] 
+
+            #GRAY SCALE
+            #img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
+            #img_gray = img_gray[..., np.newaxis]
+            #img_rgb = np.repeat(img_gray, 3, axis=-1)
 
             mask = np.load(mask_path, mmap_mode='r')[local_idx]
             if mask.ndim == 3 and mask.shape[-1] == 1:
@@ -216,28 +237,28 @@ if __name__ == "__main__":
     train_gen = DataGenerator(folds, train_IDs, batch_size=8, shuffle=True,  augment=True)
     val_gen   = DataGenerator(folds, val_IDs,   batch_size=8, shuffle=False, augment=False)
 
-    monitor_metric = 'val_seg_head_cell_dice'
-    #monitor_metric = 'val_loss'
+    #monitor_metric = 'val_seg_head_cell_dice'
+    monitor_metric = 'val_loss'
     
 
     # Callbacks (versione Keras 3)
     reduce_lr_cb = keras.callbacks.ReduceLROnPlateau(
         monitor=monitor_metric, factor=0.5, patience=3,
-        min_lr=1e-4, mode="max", verbose=1
+        min_lr=1e-4, mode="min", verbose=1
     )
     # TensorBoard è opzionale; se non ti serve, commenta:
     tensorboard_cb = keras.callbacks.TensorBoard(
         log_dir=os.path.join('logs', 'fit'),
         histogram_freq=1, write_images=False
     )
-    checkpoint_path = 'models/checkpoints/neo/model_RGB_mse2_grad1_L.keras'
+    checkpoint_path = 'models/checkpoints/neo/model_Blu.keras'
     checkpoint_cb = keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         save_best_only=True, save_weights_only=False,
-        monitor=monitor_metric, mode="max", verbose=1
+        monitor=monitor_metric, mode="min", verbose=1
     )
     earlystop_cb = keras.callbacks.EarlyStopping(
-        monitor=monitor_metric, mode="max", patience=5, restore_best_weights=True
+        monitor=monitor_metric, mode="min", patience=5, restore_best_weights=True
     )
 
     # Build model (assicurati che src.model usi keras.layers)
@@ -252,9 +273,9 @@ if __name__ == "__main__":
         optimizer=optimizer,
         loss={
             'seg_head': bce_dice_loss_ops,
-            'hv_head' : HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=1.0, ksize=5),
+            'hv_head' : HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5),
         },
-        loss_weights={'seg_head': 1.0, 'hv_head': 0.5},
+        loss_weights={'seg_head': 1.0, 'hv_head': 2.0},
         metrics={'seg_head': [CellDice()], 'hv_head': []},
     )
 
@@ -337,7 +358,7 @@ if __name__ == "__main__":
     history = model.fit(
         train_gen,
         validation_data=val_gen,
-        epochs=10,
+        epochs=30,
         callbacks=[earlystop_cb, checkpoint_cb, reduce_lr_cb,HVSobelDebugCB(val_gen)],
         verbose=1
     )
