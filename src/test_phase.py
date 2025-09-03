@@ -3,6 +3,7 @@ import os
 os.environ["KERAS_BACKEND"] = "torch" 
 import numpy as np
 from keras import ops
+import gc
 import matplotlib.pyplot as plt
 #from src.losses import bce_dice_loss, hover_loss_fixed,hovernet_hv_loss_tf,hv_keras_loss
 from keras.models import load_model
@@ -93,7 +94,7 @@ def HE_deconv(img):
     
     return ihc_h, ihc_e, ihc_d 
 
-def loadmodel(checkpoint_path, weight_seg_head=0.25, weight_hv_head=1.0):
+def loadmodel(checkpoint_path, weight_seg_head=1.0, weight_hv_head=2.0):
     model = load_model(
         checkpoint_path,
         custom_objects={
@@ -246,7 +247,7 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         X = np.stack(X_, axis=0)
     elif 'Blu' in checkpoint:
         print("Blu - Pre processing")
-        X = X / 255.0
+        X = (X+15) / 255.0
         X_ = []
         cmap = get_cmap('Blues')
         for f in X:
@@ -257,7 +258,7 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         X = np.stack(X_, axis=0)
     elif 'Gray' in checkpoint:
         print("Gray - Pre processing")
-        X = X + 15
+        X = X - 20
         X = X / 255
         X_gray = np.dot(X[..., :3], [0.2989, 0.5870, 0.1140])[..., np.newaxis].astype(np.float32)
         X = np.repeat(X_gray, 3, axis=-1).astype(np.float32)
@@ -265,10 +266,15 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         raise ValueError(f"Checkpoint non riconosciuto: {checkpoint}")
     
     model = loadmodel(checkpoint_path=checkpoint, weight_hv_head=weight_hv_head)
+    print("del")
     preds = model.predict(X, batch_size=4)
+    print("del")
     preds['hv_head'] = np.tanh(preds['hv_head'])
-    return preds, X
-
+    print("del")
+    del X, model
+    gc.collect()
+    #return preds, X
+    return preds
 def labels_scores(checkpoint, Y, HV):
     f1_score = []
     dice_score = []
@@ -445,11 +451,13 @@ def test_model_on_categories(preds, HV, Y, categories, trhld, min_area):
         ("grandi", "bassa"): []
     }
 
-    for i in range(Y.shape[0]):
+    for i in tqdm(range(Y.shape[0])):
         gt_fg = Y[i].astype(np.float32)
         gt_stack = np.stack([gt_fg.squeeze(), HV[i,...,0], HV[i,...,1]], axis=-1)
 
-        n_true = __proc_np_hv(gt_stack, GT=True)
+        Lg = __proc_np_hv(gt_stack, GT=True)
+        n_true   = int(np.max(Lg))
+        del Lg
 
         seg = seg_preds[i]
         body_prob = seg[..., 0]
@@ -459,17 +467,181 @@ def test_model_on_categories(preds, HV, Y, categories, trhld, min_area):
         pred_mask = ((body_prob + border_prob) > bg_prob).astype(np.uint8)
         pred_stack = np.stack([pred_mask, hv_preds[i,...,0], hv_preds[i,...,1]], axis=-1)
 
-        n_pred = __proc_np_hv(pred_stack, GT=False, trhld=trhld, min_area=min_area)
-
-        error = abs(n_true - n_pred)
-
-        key = categories[i]
-        results[key].append(error)
+        Lp = __proc_np_hv(pred_stack, GT=False, trhld=trhld, min_area=min_area)
+        n_pred  = int(np.max(Lp))
+        error = n_true - n_pred
+        del Lp
+        gc.collect()
+        
+        results[categories[i]].append(error)
 
     # Calcola media errore per categoria
-    results_mean = {k: np.mean(v) if v else 0 for k, v in results.items()}
+    #results_mean = {k: np.mean(v) if v else 0 for k, v in results.items()}
 
     return results
+from pathlib import Path
+import json
+LOG_DIR = Path("runs/errors")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+TXT_FILE   = LOG_DIR / "summary.txt"   # human-readable
+JSONL_FILE = LOG_DIR / "errors.jsonl"  # un record per errore
+
+def append_summary_txt(model_name, ckpt_path, results, cat_order):
+    # results: {cat_tuple: [err_i, ...], ...}
+    means = []
+    for cat in cat_order:
+        vals = results.get(cat, [])
+        means.append(np.mean(vals) if len(vals) else 0.0)
+
+    line = (
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t"
+        f"{model_name}\t{ckpt_path}\t" +
+        "\t".join(f"{cat[0]}/{cat[1]}={m:.3f}" for cat, m in zip(cat_order, means))
+        + "\n"
+    )
+    with open(TXT_FILE, "a") as f:
+        f.write(line)
+        f.flush(); os.fsync(f.fileno())  # scrittura “robusta”
+        
+def append_errors_jsonl(model_name, ckpt_path, results, cat_order):
+    with open(JSONL_FILE, "a") as f:
+        for cat in cat_order:
+            for err in results.get(cat, []):
+                rec = {
+                    "ts": time.time(),
+                    "model": model_name,
+                    "ckpt": ckpt_path,
+                    "cat": f"{cat[0]}/{cat[1]}",
+                    "err": float(err),
+                }
+                f.write(json.dumps(rec) + "\n")
+        f.flush(); os.fsync(f.fileno())
+
+from src.hv_GT_generator import build_instance_map_valuewise
+from matplotlib.patches import Patch
+
+def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
+    labeled_path = os.path.join('data', 'raw_neoplastic','Fold 3', 'masks',  'masks.npy')
+    label_M = np.load(labeled_path, mmap_mode='r')
+    label_mask = [build_instance_map_valuewise(i) for i in label_M]
+    del label_M
+    gc.collect()
+    categories = categorize_images(label_mask)
+    del label_mask
+    gc.collect()
+    # Ordine categorie (gruppi sull'asse x) e modelli (box dentro ogni gruppo)
+    order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
+    labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
+
+    # Contenitore: per ogni categoria, una lista di 4 liste (una per modello)
+    errs_by_cat = {cat: [ [] for _ in labels ] for cat in order}
+
+    def _model_label_from_ckpt(path: str) -> str:
+        if 'RGB' in path: return 'RGB'
+        if 'HE' in path or 'Hesoine' in path: return 'Hesoine'
+        if 'Blu' in path or 'Blue' in path: return 'Blu'
+        if 'Gray' in path or 'Grey' in path: return 'Gray'
+        return labels[0]  # fallback
+
+    for check in checkpoints:
+        """
+        model = load_model(
+            check,
+            custom_objects={
+                "BCEDiceLoss": bce_dice_loss_ops,
+                "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)
+            },
+            compile=False
+        )
+        model.compile(
+            optimizer=keras.optimizers.Adam(1e-3),
+            loss={"seg_head": bce_dice_loss_ops, "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)},
+            loss_weights={"seg_head": 1.0, "hv_head": 2.0},
+        )
+
+        preds = model.compile(X, batch=4)  # (lasciato invariato come richiesto)
+        """
+        preds = pre_proces(check,X)
+        results = test_model_on_categories(preds, HV, Y, categories, best_trshld, best_min_area)
+        print("SSSSS")
+        # `results` deve essere: {("piccoli","alta"): [err_i...], ...}
+        del preds
+        gc.collect()
+        mlabel = _model_label_from_ckpt(check)
+        #m_idx = labels.index(mlabel)
+
+        # Accumula gli errori grezzi per categoria e modello
+        #for cat in order:
+        #    errs_by_cat[cat][m_idx].extend(results.get(cat, []))
+        print("writing .txt file")
+        append_summary_txt(mlabel, check, results, order)
+        print("wirting .jsonl file")
+        append_errors_jsonl(mlabel, check, results, order)
+        del results
+        gc.collect()
+    # Unico grafico raggruppato
+    #_box_plot_grouped(errs_by_cat, labels, order)
+
+
+def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
+    # Impostazioni layout
+    n_groups  = len(cat_order)          # 4 categorie
+    n_models  = len(model_labels)       # 4 modelli
+    box_w     = 0.6
+    dx        = 0.8                     # distanza tra box nello stesso gruppo
+    gap       = 1.5                     # gap tra gruppi
+    colors    = ['red', 'violet', 'blue', 'gray']  # 'blue' (non 'blu')
+
+    # Prepara dati e posizioni
+    data = []
+    positions = []
+    group_centers = []
+
+    base = 1.0
+    for g, cat in enumerate(cat_order):
+        # posizioni delle 4 box del gruppo g
+        group_pos = [base + m*dx for m in range(n_models)]
+        positions.extend(group_pos)
+
+        # dati: per ogni modello, la lista errori (se vuota, metti NaN per evitare errori)
+        for m in range(n_models):
+            vals = errs_by_cat[cat][m]
+            data.append(vals if len(vals) else [np.nan])
+
+        # centro gruppo per xtick
+        group_centers.append(np.mean(group_pos))
+        # avanza base al prossimo gruppo
+        base += n_models*dx + gap
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bplots = ax.boxplot(
+        data,
+        positions=positions,
+        widths=box_w,
+        patch_artist=True,
+        manage_ticks=False,
+        showfliers=False
+    )
+
+    # Colora le box per modello (ripetendo il pattern colori)
+    for i, patch in enumerate(bplots['boxes']):
+        m = i % n_models
+        patch.set_facecolor(colors[m])
+        patch.set_alpha(0.8)
+
+    # Asse x: nomi categorie
+    ax.set_xticks(group_centers)
+    ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order])
+    ax.set_ylabel("Errore di conteggio")
+    ax.set_title("Errore di conteggio per categoria")
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+    # Legenda modelli
+    legend_patches = [Patch(facecolor=colors[m], label=model_labels[m]) for m in range(n_models)]
+    ax.legend(handles=legend_patches, title="Modello", loc="upper right")
+
+    plt.tight_layout()
+    plt.show()
 
 @dataclass
 class BiasTestResult:
@@ -586,11 +758,13 @@ checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
 checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
 
-checkpoint_paths=[checkpoint_HE]
+checkpoint_paths=[checkpoint_RGB, checkpoint_HE, checkpoint_Blu, checkpoint_Gray]
+checkpoint_paths1=[checkpoint_Blu]#, checkpoint_Gray]
 #
 #model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
-preds, X = pre_proces(checkpoint_HE, X)
+"""
+preds, X = pre_proces(checkpoint_Gray, X)
 
 print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
 print("GT per-channel min/max:",
@@ -632,151 +806,77 @@ for i in range(idx,idx + 5):
 
     plt.tight_layout()
     plt.show()
-
+"""
 t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
 #t_seed_grid  = [0.55, 0.60, 0.65]
 min_area_grid= [10, 20, 30]
 
-X_val, _, Y_val, _, HV_val, _ = train_test_split(
-    X, Y, HV, test_size=0.1, random_state=SEED
-)
+#X_val, _, Y_val, _, HV_val, _ = train_test_split(X, Y, HV, test_size=0.1, random_state=SEED)
 
-best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
-best_trshld =  best[0]
-best_min_area = best[1]
-print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+#best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+#best_trshld =  best[0]
+#best_min_area = best[1]
+#print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
 
-N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
+#N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 
-v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
+#v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
-print(v,v_)
+#print(v,v_)
 print(f"checkpoint: {checkpoint_HE}\n")
-print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
+#print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
 #RGB, HE, Blu, Gray Label
-L_scores_F1 = [0.638529049884507, 0.6217882334816339, 0.9472365862827455, 0.959334461216888]
-L_scores_Dice = [0.6069365145261811, 0.5990955220675084, 0.9472371079219255, 0.9593348696247608]
-L_scores_IoU = [0.5296632884537072, 0.5147541559041431, 0.9020675153832152, 0.923387367286549]
+L_scores_F1 = [0.638529049884507, 0.6217882334816339, 0.5328565433176484, 0.6008429076488644]
+L_scores_Dice = [0.6069365145261811, 0.5990955220675084, 0.5558155437365017, 0.5859055048258398]
+L_scores_IoU = [0.5296632884537072, 0.5147541559041431, 0.44975372872076386, 0.5007706860413675]
 
 #RGB, HE, Blu BinaryMask
-scores_F1 = [0.8700626496266222, 0.8625804271868238]
-scores_IoU = [0.655638917837067, 0.6399422174400162]
+scores_F1 = [0.8700626496266222, 0.8625804271868238, 0.8342649161441729, 0.8606370122134609]
+scores_IoU = [0.655638917837067, 0.6399422174400162, 0.5822282534396975, 0.6348060559002341]
 
-res_bias = test_count_bias(N_gt, N_pred_rgb)
+#res_bias = test_count_bias(N_gt, N_pred_rgb)
 
-plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
-
-from src.hv_GT_generator import build_instance_map_valuewise
-from matplotlib.patches import Patch
-
-def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
-    labeled_path = os.path.join('data', 'raw_neoplastic','Fold 3', 'masks',  'masks.npy')
-    label_M = np.load(labeled_path, mmap_mode='r')
-    label_mask = [build_instance_map_valuewise(i) for i in label_M]
-
-    categories = categorize_images(label_mask)
-
-    # Ordine categorie (gruppi sull'asse x) e modelli (box dentro ogni gruppo)
-    order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
-    labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
-
-    # Contenitore: per ogni categoria, una lista di 4 liste (una per modello)
-    errs_by_cat = {cat: [ [] for _ in labels ] for cat in order}
-
-    def _model_label_from_ckpt(path: str) -> str:
-        if 'RGB' in path: return 'RGB'
-        if 'HE' in path or 'Hesoine' in path: return 'Hesoine'
-        if 'Blu' in path or 'Blue' in path: return 'Blu'
-        if 'Gray' in path or 'Grey' in path: return 'Gray'
-        return labels[0]  # fallback
-
-    for check in checkpoints:
-        model = load_model(
-            check,
-            custom_objects={
-                "BCEDiceLoss": bce_dice_loss_ops,
-                "HVLoss": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)
-            },
-            compile=False
-        )
-        model.compile(
-            optimizer=keras.optimizers.Adam(1e-3),
-            loss={"seg_head": bce_dice_loss_ops, "hv_head": HVLossMonaiTorch(lambda_mse=2.0, lambda_grad=3.0, ksize=5)},
-            loss_weights={"seg_head": 1.0, "hv_head": 2.0},
-        )
-
-        preds = model.compile(X, batch=4)  # (lasciato invariato come richiesto)
-        results = test_model_on_categories(preds, HV, Y, categories, best_trshld, best_min_area)
-        # `results` deve essere: {("piccoli","alta"): [err_i...], ...}
-
-        mlabel = _model_label_from_ckpt(check)
-        m_idx = labels.index(mlabel)
-
-        # Accumula gli errori grezzi per categoria e modello
-        for cat in order:
-            errs_by_cat[cat][m_idx].extend(results.get(cat, []))
-
-    # Unico grafico raggruppato
-    _box_plot_grouped(errs_by_cat, labels, order)
+#plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
 
 
-def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
-    # Impostazioni layout
-    n_groups  = len(cat_order)          # 4 categorie
-    n_models  = len(model_labels)       # 4 modelli
-    box_w     = 0.6
-    dx        = 0.8                     # distanza tra box nello stesso gruppo
-    gap       = 1.5                     # gap tra gruppi
-    colors    = ['red', 'violet', 'blue', 'gray']  # 'blue' (non 'blu')
-
-    # Prepara dati e posizioni
-    data = []
-    positions = []
-    group_centers = []
-
-    base = 1.0
-    for g, cat in enumerate(cat_order):
-        # posizioni delle 4 box del gruppo g
-        group_pos = [base + m*dx for m in range(n_models)]
-        positions.extend(group_pos)
-
-        # dati: per ogni modello, la lista errori (se vuota, metti NaN per evitare errori)
-        for m in range(n_models):
-            vals = errs_by_cat[cat][m]
-            data.append(vals if len(vals) else [np.nan])
-
-        # centro gruppo per xtick
-        group_centers.append(np.mean(group_pos))
-        # avanza base al prossimo gruppo
-        base += n_models*dx + gap
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    bplots = ax.boxplot(
-        data,
-        positions=positions,
-        widths=box_w,
-        patch_artist=True,
-        manage_ticks=False
-    )
-
-    # Colora le box per modello (ripetendo il pattern colori)
-    for i, patch in enumerate(bplots['boxes']):
-        m = i % n_models
-        patch.set_facecolor(colors[m])
-        patch.set_alpha(0.8)
-
-    # Asse x: nomi categorie
-    ax.set_xticks(group_centers)
-    ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order])
-    ax.set_ylabel("Errore di conteggio")
-    ax.set_title("Errore di conteggio per categoria (boxplot raggruppato)")
-    ax.grid(axis='y', linestyle='--', alpha=0.4)
-
-    # Legenda modelli
-    legend_patches = [Patch(facecolor=colors[m], label=model_labels[m]) for m in range(n_models)]
-    ax.legend(handles=legend_patches, title="Modello", loc="upper right")
-
-    plt.tight_layout()
-    plt.show()
+#label_img_calc_error(checkpoint_paths,X,HV,Y,0.45,10)
 #for k, err in results.items():
 #    print(f"{k[0]} nuclei - {k[1]} densità → errore medio: {err:.2f}")
+JSONL_FILE = "runs/errors/errors.jsonl"
+
+# ordine coerente con il tuo codice
+labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
+order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
+
+def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
+                                include_models=None, include_ckpts=None):
+    errs_by_cat = {cat: [ [] for _ in labels ] for cat in order}
+    with open(jsonl_path) as f:
+        for line in f:
+            rec = json.loads(line)
+            model = rec["model"]
+            ckpt  = rec["ckpt"]
+            cat_s = rec["cat"]          # es. "piccoli/alta"
+            err   = float(rec["err"])
+
+            if include_models and model not in include_models: 
+                continue
+            if include_ckpts  and ckpt  not in include_ckpts:
+                continue
+
+            try:
+                m_idx = labels.index(model)
+            except ValueError:
+                continue
+
+            # mappa "piccoli/alta" -> ("piccoli","alta") nel tuo order
+            for k in order:
+                if f"{k[0]}/{k[1]}" == cat_s:
+                    errs_by_cat[k][m_idx].append(err)
+                    break
+    return errs_by_cat
+
+errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
+
+# ora puoi usare direttamente la tua _box_plot_grouped(...)
+_box_plot_grouped(errs_by_cat, labels, order)

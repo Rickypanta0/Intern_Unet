@@ -63,7 +63,7 @@ class DataGenerator(keras.utils.Sequence):
         list_IDs_temp = [self.sample_map[k] for k in indexes]
         return self.__data_generation(list_IDs_temp)
 
-    def _make_target_3ch(self, m2):
+    def _mask_to_3ch(self, m2):
         struct = np.ones((3, 3), dtype=bool)
 
         m2_ = 1 - m2
@@ -99,7 +99,7 @@ class DataGenerator(keras.utils.Sequence):
             img_path, mask_path, instance_path = self.folds[fold_idx]
 
             img_rgb = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img_rgb +15) / 255.0
+            img_rgb = (img_rgb - 20) / 255.0
             
             #HESOINE EXTRACTION
             
@@ -112,20 +112,20 @@ class DataGenerator(keras.utils.Sequence):
 
             #BLU CHANNEL
             
-            blu = img_rgb[...,2]
-            blu_enhanced = np.clip(blu + 0.05, 0, 1)
-            cmap = get_cmap('Blues')
-            img_rgb = cmap(blu_enhanced)[:, :, :3] 
+            #blu = img_rgb[...,2]
+            #blu_enhanced = np.clip(blu + 0.05, 0, 1)
+            #cmap = get_cmap('Blues')
+            #img_rgb = cmap(blu_enhanced)[:, :, :3] 
 
             #GRAY SCALE
-            #img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
-            #img_gray = img_gray[..., np.newaxis]
-            #img_rgb = np.repeat(img_gray, 3, axis=-1)
+            img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
+            img_gray = img_gray[..., np.newaxis]
+            img_rgb = np.repeat(img_gray, 3, axis=-1)
 
             mask = np.load(mask_path, mmap_mode='r')[local_idx]
             if mask.ndim == 3 and mask.shape[-1] == 1:
                 mask = np.squeeze(mask, axis=-1)
-
+    
             #hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
             instance_M = np.load(instance_path, mmap_mode='r')[local_idx].astype(np.float32)
             instance_map = build_instance_map_valuewise(instance_M)
@@ -154,9 +154,15 @@ class DataGenerator(keras.utils.Sequence):
             gen = GenInstanceHV(crop_shape=(H, W))
             out = gen._augment(instance_input, None)
             hv = out[..., 1:3]
-
+            #fig, axs = plt.subplots(1,2,figsize=(8,8))
+            #axs[0].imshow(hv[...,0]); axs[0].axis('off')
+            #axs[0].set_title("Horizontal map")
+            #axs[1].imshow(hv[...,1]); axs[1].axis('off')
+            #axs[1].set_title("Vertical map")
+            #plt.show()
+            import matplotlib.patches as patches
             X[i]  = img_rgb
-            Y[i]  = self._make_target_3ch(mask)
+            Y[i]  = self._mask_to_3ch(mask)
             HV[i] = np.dstack([hv, mask])
 
         return X, {'seg_head': Y, 'hv_head': HV}
@@ -251,7 +257,7 @@ if __name__ == "__main__":
         log_dir=os.path.join('logs', 'fit'),
         histogram_freq=1, write_images=False
     )
-    checkpoint_path = 'models/checkpoints/neo/model_Blu.keras'
+    checkpoint_path = 'models/checkpoints/neo/model_Gray.keras'
     checkpoint_cb = keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         save_best_only=True, save_weights_only=False,
@@ -537,7 +543,7 @@ class DataGenerator(keras.utils.Sequence):
         list_IDs_temp = [self.sample_map[k] for k in indexes]
         return self.__data_generation(list_IDs_temp)
 
-    def _make_target_3ch(self, m2):
+    def _mask_to_3ch(self, m2):
         struct = np.ones((3, 3), dtype=bool)
 
         m2_ = 1-m2
@@ -731,7 +737,7 @@ class DataGenerator(keras.utils.Sequence):
                 elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
 
             X[i] = img_rgb#preprocess_input(img_rgb*255)
-            Y[i] = self._make_target_3ch(mask)
+            Y[i] = self._mask_to_3ch(mask)
             HV[i] = np.dstack([hv, mask])   
 
         return X, {'seg_head': Y, 'hv_head': HV}
