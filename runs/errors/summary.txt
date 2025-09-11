@@ -1,4 +1,0 @@
-2025-09-02 12:22:37	RGB	models/checkpoints/neo/model_RGB.keras	piccoli/alta=-3.008	piccoli/bassa=-2.353	grandi/alta=-5.545	grandi/bassa=-4.716
-2025-09-02 12:30:56	Hesoine	models/checkpoints/neo/model_HE.keras	piccoli/alta=-3.226	piccoli/bassa=-2.345	grandi/alta=-5.942	grandi/bassa=-5.192
-2025-09-02 12:39:13	Blu	models/checkpoints/neo/model_Blu.keras	piccoli/alta=-5.544	piccoli/bassa=-4.541	grandi/alta=-8.394	grandi/bassa=-7.858
-2025-09-02 12:47:28	Gray	models/checkpoints/neo/model_Gray.keras	piccoli/alta=-2.577	piccoli/bassa=-1.512	grandi/alta=-5.794	grandi/bassa=-5.595

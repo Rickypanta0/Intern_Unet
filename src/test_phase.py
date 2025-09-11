@@ -119,6 +119,8 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     I_f1_list = []
     I_dice_list = []
     I_iou_list = []
+    I_sq_list = []
+    I_pq_list = []
     seg_preds = preds['seg_head']
     hv_preds  = preds['hv_head']
 
@@ -136,7 +138,7 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     f1_pos    = 2*tp / (2*tp + fp + fn) if (2*tp + fp + fn) else 1.0
     f1_neg    = 2*tn / (2*tn + fp + fn) if (2*tn + fp + fn) else 1.0
     f1_pixel  = float((f1_pos + f1_neg) / 2)
-
+    best = [0,0]
     #t_hv = t_aji = t_pq = t_dice = t_misc = 0.0
     for i in tqdm(range(Y.shape[0])):
         t0 = time.perf_counter()
@@ -187,19 +189,26 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
         #print(f"ISTANCE: IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
         #t_dice += time.perf_counter() - t0
         #print(f"HV:{t_hv:.2f}s  AJI:{t_aji:.2f}s  PQ:{t_pq:.2f}s  Dice:{t_dice:.2f}s  Misc:{t_misc:.2f}s")
+        if best[0] < f1:
+            best[0] = f1
+            best[1] = i
         I_f1_list.append(f1)
         I_iou_list.append(iou_val)
         I_dice_list.append(dice_val)
-
+        I_sq_list.append(sq)
+        I_pq_list.append(pq)
+    print(f"BEST sample, index: {best[1]}")
     f1r = np.mean(I_f1_list)
     dicer = np.mean(I_dice_list)
     iour = np.mean(I_iou_list)
+    sqr = np.mean(I_sq_list)
+    pqr = np.mean(I_pq_list)
 
-    return [f1r, dicer, iour], [iou_pixel, f1_pixel]
+    return [f1r, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
 
 def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     # Crea DataFrame
-    df = pd.DataFrame(index=["RGB", "Hesoine", "Blue Channel", "Gray"],
+    df = pd.DataFrame(index=["RGB", "Hematoxylin", "Blue Channel", "Gray"],
                       columns=["F1", "Dice", "IoU"])
     df['F1'] = scores_F1
     df['Dice'] = scores_Dice
@@ -247,7 +256,7 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         X = np.stack(X_, axis=0)
     elif 'Blu' in checkpoint:
         print("Blu - Pre processing")
-        X = (X+15) / 255.0
+        X = (X+12) / 255.0
         X_ = []
         cmap = get_cmap('Blues')
         for f in X:
@@ -271,10 +280,9 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
     print("del")
     preds['hv_head'] = np.tanh(preds['hv_head'])
     print("del")
-    del X, model
+    del model
     gc.collect()
-    #return preds, X
-    return preds
+    return preds, X
 def labels_scores(checkpoint, Y, HV):
     f1_score = []
     dice_score = []
@@ -293,7 +301,7 @@ def labels_scores(checkpoint, Y, HV):
     #print_labels(f1_score,dice_score,iou_score)
 
 
-from src.postprocessing import __proc_np_hv
+from src.postprocessing import __proc_np_hv, count_blob
 from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds, trhld=0.43, min_area=10):
@@ -327,18 +335,35 @@ def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds, trhld=0.43, 
         N_gt.append(np.max(np.unique(label_gt)))
     N_gt   = np.array(N_gt)
     N_pred = np.array(N_pred)
-    
-    # 2. Scatter + linea y=x
+    eps = 1e-6  # piccolo offset per evitare log(0)
+
+    # Applico offset ai dati
+    N_gt_safe = N_gt + eps
+    N_pred_safe = N_pred + eps
+
+    max_val = max(N_gt_safe.max(), N_pred_safe.max())
+    min_val = min(N_gt_safe.min(), N_pred_safe.min())
+
+    # 2. Scatter + linea y=x (in log scale)
     plt.figure(figsize=(4,4))
-    plt.scatter(N_gt, N_pred, s=15, alpha=0.7)
-    plt.plot([0, N_gt.max()], [0, N_gt.max()], 'k--')
-    plt.xlabel('Nuclei GT'); plt.ylabel('Nuclei predetti')
+    plt.scatter(N_gt_safe, N_pred_safe, s=15, alpha=0.7)
+    plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+
+    plt.xlim(min_val, max_val)
+    plt.ylim(min_val, max_val)
+    plt.axis("equal")
+    plt.xlabel('Nuclei GT')
+    plt.ylabel('Nuclei predicted')
+
+    # Assi logaritmici
+    plt.xscale("log")
+    plt.yscale("log")
 
     # 3. Correlazione e MAE
     r, _ = pearsonr(N_gt, N_pred)
     r2 = r2_score(N_gt, N_pred) #https://arxiv.org/pdf/2409.04175#page=1.98 [69]
     mae  = np.mean(np.abs(N_gt - N_pred))
-    plt.title(f'ρ = {r:.3f}, MAE = {mae:.1f}, R2 = {r2}')
+    print(f'ρ = {r:.3f}, MAE = {mae:.1f}, R2 = {r2}')
     plt.tight_layout(); plt.show()
     
     return N_gt, N_pred
@@ -531,14 +556,14 @@ def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
     gc.collect()
     # Ordine categorie (gruppi sull'asse x) e modelli (box dentro ogni gruppo)
     order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
-    labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
+    labels = ['RGB', 'Hematoxylin', 'Blu', 'Gray']
 
     # Contenitore: per ogni categoria, una lista di 4 liste (una per modello)
     errs_by_cat = {cat: [ [] for _ in labels ] for cat in order}
 
     def _model_label_from_ckpt(path: str) -> str:
         if 'RGB' in path: return 'RGB'
-        if 'HE' in path or 'Hesoine' in path: return 'Hesoine'
+        if 'HE' in path or 'Hematoxylin' in path: return 'Hematoxylin'
         if 'Blu' in path or 'Blue' in path: return 'Blu'
         if 'Gray' in path or 'Grey' in path: return 'Gray'
         return labels[0]  # fallback
@@ -753,18 +778,20 @@ high = max(1, X.shape[0] - (k - 5))                    # ultimo indice di parten
 idx = np.random.randint(0, high)  
 
 
-checkpoint_Blu='models/checkpoints/neo/model_Blu.keras'
-checkpoint_HE = 'models/checkpoints/neo/model_HE.keras'
-checkpoint_RGB = 'models/checkpoints/neo/model_RGB.keras'
-checkpoint_Gray = 'models/checkpoints/neo/model_Gray.keras'
+checkpoint_Blu='models/checkpoints/neo/model_Blu_100.keras'
+checkpoint_HE = 'models/checkpoints/neo/model_HE_100.keras'
+checkpoint_RGB = 'models/checkpoints/neo/model_RGB_100.keras'
+checkpoint_Gray = 'models/checkpoints/neo/model_Gray_100.keras'
 
 checkpoint_paths=[checkpoint_RGB, checkpoint_HE, checkpoint_Blu, checkpoint_Gray]
 checkpoint_paths1=[checkpoint_Blu]#, checkpoint_Gray]
 #
-#model = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
+#model, X_ = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
-"""
+
 preds, X = pre_proces(checkpoint_Gray, X)
+seg_val_preds = preds['seg_head']
+hv_val_preds  = preds['hv_head']
 
 print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
 print("GT per-channel min/max:",
@@ -772,8 +799,7 @@ print("GT per-channel min/max:",
       HV[...,1].min(), HV[...,1].max())
 print("channels equal? mean|x-y| =", np.mean(np.abs(HV[...,0]-HV[...,1])))
 
-seg_val_preds = preds['seg_head']
-hv_val_preds  = preds['hv_head']
+
 #print("pred per-channel min/max:",
 #      hv_val_preds[...,0].min(), hv_val_preds[...,0].max(),
 #      hv_val_preds[...,1].min(), hv_val_preds[...,1].max())
@@ -806,46 +832,44 @@ for i in range(idx,idx + 5):
 
     plt.tight_layout()
     plt.show()
-"""
+
 t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
-#t_seed_grid  = [0.55, 0.60, 0.65]
+t_seed_grid  = [0.55, 0.60, 0.65]
 min_area_grid= [10, 20, 30]
 
 #X_val, _, Y_val, _, HV_val, _ = train_test_split(X, Y, HV, test_size=0.1, random_state=SEED)
 
-#best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
-#best_trshld =  best[0]
-#best_min_area = best[1]
-#print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+best_trshld =  best[0]
+best_min_area = best[1]
+print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
 
-#N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
+N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 
-#v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
+v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
-#print(v,v_)
+print(v,v_)
 print(f"checkpoint: {checkpoint_HE}\n")
-#print(f"F1: {v[0]}, Dice: {v[1]}, IoU: {v[2]}")
-#RGB, HE, Blu, Gray Label
-L_scores_F1 = [0.638529049884507, 0.6217882334816339, 0.5328565433176484, 0.6008429076488644]
-L_scores_Dice = [0.6069365145261811, 0.5990955220675084, 0.5558155437365017, 0.5859055048258398]
-L_scores_IoU = [0.5296632884537072, 0.5147541559041431, 0.44975372872076386, 0.5007706860413675]
 
-#RGB, HE, Blu BinaryMask
-scores_F1 = [0.8700626496266222, 0.8625804271868238, 0.8342649161441729, 0.8606370122134609]
-scores_IoU = [0.655638917837067, 0.6399422174400162, 0.5822282534396975, 0.6348060559002341]
+#[f1r, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
+#RGB -> [0.638529049884507, 0.6069365145261811, 0.5296632884537072, 0.7014137124919058, 0.47600719695266175] [0.655638917837067, 0.8700626496266222]
+#HE -> [0.6217882334816339, 0.5990955220675084, 0.5147541559041431, 0.6877179093401616, 0.45616410219859205] [0.6399422174400162, 0.8625804271868238]
+#Blu -> [0.5328565433176484, 0.5558155437365017, 0.44975372872076386, 0.670905052806835, 0.387711913506252] [0.5822282534396975, 0.8342649161441729]
+#Gray -> [0.6008429076488644, 0.5859055048258398, 0.5007706860413675, 0.6920226302391269, 0.4449899290615991] [0.6348060559002341, 0.8606370122134609]
+
 
 #res_bias = test_count_bias(N_gt, N_pred_rgb)
 
 #plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
 
 
-#label_img_calc_error(checkpoint_paths,X,HV,Y,0.45,10)
+label_img_calc_error(checkpoint_paths,X,HV,Y,best_trshld ,best_min_area)
 #for k, err in results.items():
 #    print(f"{k[0]} nuclei - {k[1]} densità → errore medio: {err:.2f}")
 JSONL_FILE = "runs/errors/errors.jsonl"
 
 # ordine coerente con il tuo codice
-labels = ['RGB', 'Hesoine', 'Blu', 'Gray']
+labels = ['RGB', 'Hematoxylin', 'Blu', 'Gray']
 order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
 
 def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
@@ -876,7 +900,7 @@ def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
                     break
     return errs_by_cat
 
-errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
+#errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
 
 # ora puoi usare direttamente la tua _box_plot_grouped(...)
-_box_plot_grouped(errs_by_cat, labels, order)
+#_box_plot_grouped(errs_by_cat, labels, order)

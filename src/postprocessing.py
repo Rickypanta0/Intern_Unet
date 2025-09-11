@@ -120,7 +120,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     )
 
     overall = np.maximum(sobelh, sobelv)
-    
+
     overall[blb>0] = 3
     #plt.imshow(overall)
     #plt.show()
@@ -145,7 +145,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     #plt.show()
     return instance_map
 
-def count_blob(labels, blb, GT=False):
+def count_blob(labels, blb, img, GT=False):
     # Se blb ha valori float o non è in formato uint8, lo normalizzo per la visualizzazione
     if blb.dtype != np.uint8:
         blb_norm = cv2.normalize(blb, None, 0, 255, cv2.NORM_MINMAX)
@@ -154,9 +154,13 @@ def count_blob(labels, blb, GT=False):
         blb_uint8 = blb
     if 255 not in np.unique(blb_uint8):
         blb_uint8 = blb_uint8 * 255
-    
-    # Converti in BGR per disegnare i contorni
-    contour_img = cv2.cvtColor(blb_uint8, cv2.COLOR_GRAY2BGR)
+
+    img32 = img.astype(np.float32)  # OpenCV supporta float32
+
+    if img32.ndim == 2 or (img32.ndim == 3 and img32.shape[2] == 1):
+        contour_img = cv2.cvtColor(img32, cv2.COLOR_GRAY2BGR)
+    else:
+        contour_img = cv2.cvtColor(img32, cv2.COLOR_RGB2BGR)
     #fig, axs = plt.subplots(1,2,figsize=(8,8))
     #axs[0].imshow(contour_img)
     #axs[1].imshow(labels)
@@ -213,7 +217,7 @@ def count_blob(labels, blb, GT=False):
         #    cv2.drawContours(contour_img, [cntr], 0, (0, 0, 255), 2)
         #    cluster_count += 1
         #else:
-        cv2.drawContours(contour_img, [cntr], 0, (0, 255, 0), 2)
+        cv2.drawContours(img, [cntr], 0, (0, 255, 0), 2)
         isolated_count += 1
 
     return (contour_img, isolated_count, cluster_count)
@@ -239,9 +243,9 @@ def nucle_counting(X_train, HV_train, Y_train, preds, i):
     print(Y_train[i].shape, hv_t[..., 0].shape)
     pred_GT = np.stack([Y_train[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
     label_map_GT = __proc_np_hv(pred_GT, GT=True)
-    contour_img_blb, isolated_count_blb, _ = count_blob(label_map, prob_nucleus)
+    contour_img_pred, isolated_count_blb, _ = count_blob(label_map, prob_nucleus)
     contour_img_gt, isolated_count_hv, _ = count_blob(label_map_GT, Y_train[i], GT=True)
     #stampa
     print(f"Blb: {isolated_count_blb}, HV: {isolated_count_hv}\n")
 
-    return isolated_count_blb, contour_img_blb, isolated_count_hv, contour_img_gt
+    return isolated_count_blb, contour_img_pred, isolated_count_hv, contour_img_gt

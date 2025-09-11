@@ -99,7 +99,7 @@ class DataGenerator(keras.utils.Sequence):
             img_path, mask_path, instance_path = self.folds[fold_idx]
 
             img_rgb = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img_rgb - 20) / 255.0
+            img_rgb = (img_rgb + 15) / 255.0
             
             #HESOINE EXTRACTION
             
@@ -112,15 +112,15 @@ class DataGenerator(keras.utils.Sequence):
 
             #BLU CHANNEL
             
-            #blu = img_rgb[...,2]
-            #blu_enhanced = np.clip(blu + 0.05, 0, 1)
-            #cmap = get_cmap('Blues')
-            #img_rgb = cmap(blu_enhanced)[:, :, :3] 
+            blu = img_rgb[...,2]
+            blu_enhanced = np.clip(blu + 0.05, 0, 1)
+            cmap = get_cmap('Blues')
+            img_rgb = cmap(blu_enhanced)[:, :, :3] 
 
             #GRAY SCALE
-            img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
-            img_gray = img_gray[..., np.newaxis]
-            img_rgb = np.repeat(img_gray, 3, axis=-1)
+            #img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
+            #img_gray = img_gray[..., np.newaxis]
+            #img_rgb = np.repeat(img_gray, 3, axis=-1)
 
             mask = np.load(mask_path, mmap_mode='r')[local_idx]
             if mask.ndim == 3 and mask.shape[-1] == 1:
@@ -257,7 +257,7 @@ if __name__ == "__main__":
         log_dir=os.path.join('logs', 'fit'),
         histogram_freq=1, write_images=False
     )
-    checkpoint_path = 'models/checkpoints/neo/model_Gray.keras'
+    checkpoint_path = 'models/checkpoints/neo/model_Blu_100.keras'
     checkpoint_cb = keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         save_best_only=True, save_weights_only=False,
@@ -364,7 +364,7 @@ if __name__ == "__main__":
     history = model.fit(
         train_gen,
         validation_data=val_gen,
-        epochs=30,
+        epochs=100,
         callbacks=[earlystop_cb, checkpoint_cb, reduce_lr_cb,HVSobelDebugCB(val_gen)],
         verbose=1
     )
@@ -405,6 +405,26 @@ if __name__ == "__main__":
     m_pred = ((gx_p.abs() + gy_p.abs()) * focus).sum() / (focus.sum() + 1e-8)
     print("⟨|∂H_true|+|∂V_true|⟩_nuclei =", float(m_true))
     print("⟨|∂H_pred|+|∂V_pred|⟩_nuclei =", float(m_pred))
+
+#OVERFITTING ?
+metrics = set().union(*[h.keys() for h in history])
+
+merged = {
+    m: np.concatenate([np.array(h.get(m, []), dtype=float) for h in history])
+    for m in metrics
+}
+
+# indici epoca cumulativi
+n1 = len(history['loss'])
+epochs = np.arange(1, n1 + 1)
+
+# --- PLOT ---
+plt.figure(figsize=(7,4))
+plt.plot(epochs, merged['loss'], label='train loss')
+plt.plot(epochs, merged['val_loss'], label='val loss')
+# linee verticali a separare le fasi
+plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.title('Unified loss')
+plt.legend(); plt.tight_layout(); plt.show()
 """
 import tensorflow as tf
 gpus = tf.config.list_physical_devices("GPU")
