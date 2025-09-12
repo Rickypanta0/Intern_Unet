@@ -1,0 +1,4 @@
+2025-09-12 14:39:25	Blu	models/checkpoints/neo/model_Blu_100.keras	piccoli/alta=-3.544	piccoli/bassa=-2.324	grandi/alta=-6.196	grandi/bassa=-5.157
+2025-09-12 14:50:18	Gray	models/checkpoints/neo/model_Gray_100.keras	piccoli/alta=-2.734	piccoli/bassa=-1.339	grandi/alta=-6.021	grandi/bassa=-4.972
+2025-09-12 16:46:01	RGB	models/checkpoints/neo/model_RGB_100.keras	piccoli/alta=-2.656	piccoli/bassa=-2.233	grandi/alta=-4.917	grandi/bassa=-4.288
+2025-09-12 16:56:50	Hematoxylin	models/checkpoints/neo/model_HE_100.keras	piccoli/alta=-2.772	piccoli/bassa=-1.770	grandi/alta=-5.665	grandi/bassa=-4.804

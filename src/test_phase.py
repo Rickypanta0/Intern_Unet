@@ -139,6 +139,8 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     f1_neg    = 2*tn / (2*tn + fp + fn) if (2*tn + fp + fn) else 1.0
     f1_pixel  = float((f1_pos + f1_neg) / 2)
     best = [0,0]
+    mean = [None, 0.640, float('inf')]
+    worst = [None, float("-inf")]
     #t_hv = t_aji = t_pq = t_dice = t_misc = 0.0
     for i in tqdm(range(Y.shape[0])):
         t0 = time.perf_counter()
@@ -189,15 +191,25 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
         #print(f"ISTANCE: IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
         #t_dice += time.perf_counter() - t0
         #print(f"HV:{t_hv:.2f}s  AJI:{t_aji:.2f}s  PQ:{t_pq:.2f}s  Dice:{t_dice:.2f}s  Misc:{t_misc:.2f}s")
-        if best[0] < f1:
-            best[0] = f1
-            best[1] = i
+        if best[1] < f1:
+            best[1] = f1
+            best[0] = i
+        if abs(mean[1] - f1)<mean[2]:
+            mean[0]=i
+            mean[2]=np.abs(mean[1]-f1)
+        n_true = np.max(np.unique(label_true))
+        n_pred = np.max(np.unique(label_pred))
+        if worst[1]<abs(n_true-n_pred):
+            worst[1]=abs(n_true-n_pred)
+            worst[0]=i
         I_f1_list.append(f1)
         I_iou_list.append(iou_val)
         I_dice_list.append(dice_val)
         I_sq_list.append(sq)
         I_pq_list.append(pq)
-    print(f"BEST sample, index: {best[1]}")
+    print(f"BEST sample, index: {best[0]}")
+    print(f"MEAN sample, index: {mean[0]}")
+    print(f"WORST sample, index: {worst[0]}")
     f1r = np.mean(I_f1_list)
     dicer = np.mean(I_dice_list)
     iour = np.mean(I_iou_list)
@@ -237,9 +249,9 @@ def hema_rgb( img_rgb01):  # img in [0,1]
         return np.clip(img_h, 0, 1) 
 
 def pre_proces(checkpoint, X, weight_hv_head=2.0):
+    X_ = []
     if 'RGB' in checkpoint:
         print("RGB - Pre processing")
-        X_ = []
         for f in X:
             f_ = (f+5)/255
             #f_ = preprocess_input(f)
@@ -247,7 +259,6 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         X = np.stack(X_, axis=0)
     elif 'HE' in checkpoint:
         X = X / 255.0
-        X_ = []
         print("HE - Pre processing")
         for f in X:
             ihc_h = hema_rgb(f)
@@ -256,15 +267,21 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
         X = np.stack(X_, axis=0)
     elif 'Blu' in checkpoint:
         print("Blu - Pre processing")
-        X = (X+12) / 255.0
-        X_ = []
+        from matplotlib.cm import get_cmap
         cmap = get_cmap('Blues')
-        for f in X:
-            blu = f[..., 2]
-            blu_enhanced = np.clip(blu + 0.05, 0, 1)
-            img_rgb = cmap(blu_enhanced)[..., :3]
-            X_.append(img_rgb)
-        X = np.stack(X_, axis=0)
+
+        X = ((X + 12) / 255.0).astype(np.float32, copy=False)
+        n, h, w, _ = X.shape
+        X_out = np.empty((n, h, w, 3), dtype=np.float32)
+
+        blu = X[..., 2]  # float32
+        for i in range(n):
+            b = np.clip(blu[i] + 0.05, 0.0, 1.0)  # (h,w) float32
+            # cmap -> RGBA float64; subito a float32 e solo RGB
+            rgb = np.asarray(cmap(b), dtype=np.float32)[..., :3]
+            X_out[i] = rgb
+        X = X_out  # no liste, no stack
+        del X_out, blu  # libera subito
     elif 'Gray' in checkpoint:
         print("Gray - Pre processing")
         X = X - 20
@@ -280,9 +297,10 @@ def pre_proces(checkpoint, X, weight_hv_head=2.0):
     print("del")
     preds['hv_head'] = np.tanh(preds['hv_head'])
     print("del")
-    del model
+    del model, X_
     gc.collect()
     return preds, X
+
 def labels_scores(checkpoint, Y, HV):
     f1_score = []
     dice_score = []
@@ -347,24 +365,39 @@ def grafo_diffusione(test_set_img, test_set_gt, test_set_hv, preds, trhld=0.43, 
     # 2. Scatter + linea y=x (in log scale)
     plt.figure(figsize=(4,4))
     plt.scatter(N_gt_safe, N_pred_safe, s=15, alpha=0.7)
-    plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+    plt.plot([min_val, max_val], [min_val, max_val], 'k--', marker='o', markersize=0.7)
 
     plt.xlim(min_val, max_val)
     plt.ylim(min_val, max_val)
-    plt.axis("equal")
     plt.xlabel('Nuclei GT')
     plt.ylabel('Nuclei predicted')
-
-    # Assi logaritmici
-    plt.xscale("log")
-    plt.yscale("log")
 
     # 3. Correlazione e MAE
     r, _ = pearsonr(N_gt, N_pred)
     r2 = r2_score(N_gt, N_pred) #https://arxiv.org/pdf/2409.04175#page=1.98 [69]
     mae  = np.mean(np.abs(N_gt - N_pred))
     print(f'ρ = {r:.3f}, MAE = {mae:.1f}, R2 = {r2}')
-    plt.tight_layout(); plt.show()
+    plt.show()
+    X= N_gt  
+    Y= N_pred
+    import seaborn as sns
+    jitter_strength = 0.2
+    X_jit = X + np.random.normal(0, jitter_strength, size=len(X))
+    Y_jit = Y + np.random.normal(0, jitter_strength, size=len(Y))
+    plt.figure(figsize=(8,6))
+    sns.scatterplot(x=X_jit, y=Y_jit, s=5, alpha=0.4, edgecolor=None)
+
+    plt.xlabel("Nuclei GT")
+    plt.ylabel("Nuclei predicted")
+    plt.grid(True)
+    plt.show()
+    
+    df = pd.DataFrame({'Nuclei GT': X, 'Nuclei predicted': Y})
+    df_sample = df.sample(1000)
+    plt.plot( 'Nuclei GT', 'Nuclei predicted', "", data=df_sample, linestyle='', marker='o')
+    plt.xlabel('Nuclei GT')
+    plt.ylabel('Nuclei predicted')
+    plt.show()
     
     return N_gt, N_pred
 from dataclasses import dataclass
@@ -586,7 +619,7 @@ def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
 
         preds = model.compile(X, batch=4)  # (lasciato invariato come richiesto)
         """
-        preds = pre_proces(check,X)
+        preds, _ = pre_proces(check,X)
         results = test_model_on_categories(preds, HV, Y, categories, best_trshld, best_min_area)
         print("SSSSS")
         # `results` deve essere: {("piccoli","alta"): [err_i...], ...}
@@ -656,14 +689,15 @@ def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
 
     # Asse x: nomi categorie
     ax.set_xticks(group_centers)
-    ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order])
-    ax.set_ylabel("Errore di conteggio")
-    ax.set_title("Errore di conteggio per categoria")
+    cat_order_eng  = [("small","high"), ("small","low"), ("big","high"), ("big","low")]
+    ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order_eng])
+    ax.set_ylabel("Count error")
+    #ax.set_title("Count error by categories")
     ax.grid(axis='y', linestyle='--', alpha=0.4)
 
     # Legenda modelli
     legend_patches = [Patch(facecolor=colors[m], label=model_labels[m]) for m in range(n_models)]
-    ax.legend(handles=legend_patches, title="Modello", loc="upper right")
+    ax.legend(handles=legend_patches, title="Model", loc="upper right")
 
     plt.tight_layout()
     plt.show()
@@ -783,16 +817,80 @@ checkpoint_HE = 'models/checkpoints/neo/model_HE_100.keras'
 checkpoint_RGB = 'models/checkpoints/neo/model_RGB_100.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray_100.keras'
 
-checkpoint_paths=[checkpoint_RGB, checkpoint_HE, checkpoint_Blu, checkpoint_Gray]
-checkpoint_paths1=[checkpoint_Blu]#, checkpoint_Gray]
+checkpoint_paths=[checkpoint_RGB, checkpoint_HE]#, checkpoint_Blu, checkpoint_Gray]
+checkpoint_paths1=[checkpoint_Gray]#, checkpoint_Gray]
 #
 #model, X_ = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
 
-preds, X = pre_proces(checkpoint_Gray, X)
-seg_val_preds = preds['seg_head']
-hv_val_preds  = preds['hv_head']
 
+preds, X = pre_proces(checkpoint_RGB, X)
+seg_preds = preds['seg_head']
+hv_preds  = preds['hv_head']
+
+def test_qualitative(X,Y, seg_preds, hv_preds,i, trhld=0.43, min_area=10):
+
+    mask_gt = X[i]
+    #costruzione maschera binaria
+    seg = seg_preds[i]
+    body_prob = seg[..., 0]
+    border_prob = seg[..., 2]
+    bg_prob = seg[..., 1]
+    mask_pred = (body_prob + border_prob > bg_prob).clip(0, 1).astype(np.float32)
+    #determinazione labels pred
+    hv = hv_preds[i]
+    pred = np.stack([mask_pred, hv[..., 0], hv[..., 1]], axis=-1)
+    # segmentazione con watershed guidata da HV map
+    label_pred = __proc_np_hv(pred,trhld=trhld, min_area=min_area)
+
+    plt.imshow(mask_gt)
+    plt.axis("off")
+    plt.show()
+    plt.imshow(mask_pred, cmap="gray")
+    plt.axis("off")
+    plt.show()
+    plt.imshow(hv[...,0])
+    plt.axis("off")
+    plt.show()
+    plt.imshow(hv[...,1])
+    plt.axis("off")
+    plt.show()
+    count_blob(label_pred, mask_pred, mask_gt)
+    #determinazione labels GT
+    hv_t = HV[i]
+    pred_ = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
+    label_gt = __proc_np_hv(pred_,GT=True)
+    plt.imshow(label_gt)
+    plt.show()
+    plt.imshow(Y[i], cmap="gray")
+    plt.axis("off")
+    plt.show()
+    plt.imshow(hv_t[...,0])
+    plt.axis("off")
+    plt.show()
+    plt.imshow(hv_t[...,1])
+    plt.axis("off")
+    plt.show()
+
+    count_blob(label_gt, mask_gt, mask_gt)
+
+    N_pred = np.max(np.unique(label_pred))
+    N_gt =  np.max(np.unique(label_gt))
+
+    mae = abs(N_gt-N_pred)
+
+    iou_val = get_fast_aji(label_gt, label_pred, pred_, pred, seg, X[i])
+
+    outcome,_ = get_fast_pq(label_gt, label_pred)
+    f1, sq, pq = outcome
+
+    dice_val = get_fast_dice_2(label_gt, label_pred)
+    print(f"MAE: {mae}, AIJ: {iou_val}, Dice: {dice_val}, DQ: {f1}, SQ: {sq}, PQ: {pq}")
+    return N_gt, N_pred
+
+test_qualitative(X,Y,seg_preds, hv_preds, 1357, trhld=0.45)
+
+"""
 print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
 print("GT per-channel min/max:",
       HV[...,0].min(), HV[...,0].max(),
@@ -836,22 +934,22 @@ for i in range(idx,idx + 5):
 t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
 t_seed_grid  = [0.55, 0.60, 0.65]
 min_area_grid= [10, 20, 30]
-
+"""
 #X_val, _, Y_val, _, HV_val, _ = train_test_split(X, Y, HV, test_size=0.1, random_state=SEED)
 
-best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
-best_trshld =  best[0]
-best_min_area = best[1]
-print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+#best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+#print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
+best_trshld =  0.45#best[0]
+best_min_area = 10#best[1]
 
-N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
+#N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 
 v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
 print(v,v_)
-print(f"checkpoint: {checkpoint_HE}\n")
+#print(f"checkpoint: {checkpoint_HE}\n")
 
-#[f1r, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
+#[dq, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
 #RGB -> [0.638529049884507, 0.6069365145261811, 0.5296632884537072, 0.7014137124919058, 0.47600719695266175] [0.655638917837067, 0.8700626496266222]
 #HE -> [0.6217882334816339, 0.5990955220675084, 0.5147541559041431, 0.6877179093401616, 0.45616410219859205] [0.6399422174400162, 0.8625804271868238]
 #Blu -> [0.5328565433176484, 0.5558155437365017, 0.44975372872076386, 0.670905052806835, 0.387711913506252] [0.5822282534396975, 0.8342649161441729]
@@ -863,7 +961,7 @@ print(f"checkpoint: {checkpoint_HE}\n")
 #plot_bias_histogram(N_gt, N_pred_rgb, res_bias, title="Bias conteggio – modello RGB")
 
 
-label_img_calc_error(checkpoint_paths,X,HV,Y,best_trshld ,best_min_area)
+#label_img_calc_error(checkpoint_paths,X,HV,Y,best_trshld ,best_min_area)
 #for k, err in results.items():
 #    print(f"{k[0]} nuclei - {k[1]} densità → errore medio: {err:.2f}")
 JSONL_FILE = "runs/errors/errors.jsonl"
@@ -900,7 +998,7 @@ def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
                     break
     return errs_by_cat
 
-#errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
+errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
 
 # ora puoi usare direttamente la tua _box_plot_grouped(...)
-#_box_plot_grouped(errs_by_cat, labels, order)
+_box_plot_grouped(errs_by_cat, labels, order)

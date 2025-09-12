@@ -333,7 +333,6 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
     # mmap: niente RAM sprecata
     masks = np.load(masks_path, mmap_mode='r')  # shape: (N, H, W, 6)
     N, H, W, _ = masks.shape
-
     # Prealloca array per salvare le HV maps
     distance_maps = np.zeros((N, H, W, 2), dtype=np.float32)
     blbs = np.zeros((N, H, W, 1), dtype=np.float32)
@@ -381,8 +380,6 @@ def generate_distance_maps(masks_path: str, out_name: str = "distance.npy"):
 folds = [os.path.join('data', 'raw_neoplastic', 'Fold 2', 'masks', 'masks.npy'),
          os.path.join('data', 'raw_neoplastic', 'Fold 3', 'masks', 'masks.npy'),
         os.path.join('data', 'raw_neoplastic', 'Fold 1', 'masks', 'masks.npy')] 
-
-
 
 #for i in folds:
 #    generate_distance_maps(i)

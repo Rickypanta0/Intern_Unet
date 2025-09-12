@@ -120,10 +120,8 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     )
 
     overall = np.maximum(sobelh, sobelv)
-
+    
     overall[blb>0] = 3
-    #plt.imshow(overall)
-    #plt.show()
 
     boundary_mask = overall > trhld  # es. 0.4
     kernel = np.ones((3,3),np.uint8)
@@ -144,7 +142,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     #axs[2].imshow(instance_map)
     #plt.show()
     return instance_map
-
+"""
 def count_blob(labels, blb, img, GT=False):
     # Se blb ha valori float o non è in formato uint8, lo normalizzo per la visualizzazione
     if blb.dtype != np.uint8:
@@ -169,6 +167,7 @@ def count_blob(labels, blb, img, GT=False):
     isolated_count = 0
     cluster_count = 0
     #print(np.unique(labels))
+    from skimage.measure import regionprops
     for label in np.unique(labels):
         if label <= 0:
             continue
@@ -176,7 +175,7 @@ def count_blob(labels, blb, img, GT=False):
         single_mask = (labels == label).astype(np.uint8) * 255
 
         cnts, _ = cv2.findContours(single_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        treshold = 1 if GT else 11
+        treshold = 1 if GT else 10
         
         def debug_visual(label, single_mask, labels, blb_uint8, contour_img):
             fig, axs = plt.subplots(1, 4, figsize=(16, 4))
@@ -212,16 +211,52 @@ def count_blob(labels, blb, img, GT=False):
         if convex_hull_area == 0:
             continue  # Evita divisione per zero
 
-        ratio = area / convex_hull_area
-        #if ratio < 0.91:
-        #    cv2.drawContours(contour_img, [cntr], 0, (0, 0, 255), 2)
-        #    cluster_count += 1
-        #else:
         cv2.drawContours(img, [cntr], 0, (0, 255, 0), 2)
         isolated_count += 1
-
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
     return (contour_img, isolated_count, cluster_count)
+"""
+from skimage.measure import regionprops
 
+def count_blob(labels, blb, img, GT=False):
+    """
+    Disegna un solo contorno per ogni istanza (label > 0) su una copia di `img`.
+    Ritorna (immagine_con_contorni, n_isolati).
+    Conta solo gli isolated (tutti vengono considerati tali).
+    """
+    # --- prepara immagine di sfondo (BGR per cv2) ---
+    img32 = img.astype(np.float32, copy=False)
+    if img32.ndim == 2 or (img32.ndim == 3 and img32.shape[2] == 1):
+        base_bgr = cv2.cvtColor(img32, cv2.COLOR_GRAY2BGR)
+    else:
+        base_bgr = cv2.cvtColor(img32, cv2.COLOR_RGB2BGR)
+    out = base_bgr.copy()
+
+    isolated_count = 0
+
+    # --- per ogni istanza (label > 0): un contorno esterno ---
+    for r in regionprops(labels):
+        if r.label <= 0:
+            continue
+
+        # maschera binaria dell'istanza
+        mask = np.zeros_like(labels, dtype=np.uint8)
+        rr, cc = r.coords[:, 0], r.coords[:, 1]
+        mask[rr, cc] = 255
+
+        # contorno esterno più grande
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cntr = max(cnts, key=cv2.contourArea)
+
+        isolated_count += 1
+        cv2.drawContours(out, [cntr], -1, (0, 255, 0), 2)  # verde
+    plt.imshow(out)
+    plt.show()
+    return out, isolated_count, _
 def nucle_counting(X_train, HV_train, Y_train, preds, i):
     seg_preds = preds['seg_head']
     hv_preds  = preds['hv_head']  # (batch, H, W, 2)
