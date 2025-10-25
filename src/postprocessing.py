@@ -142,7 +142,7 @@ def __proc_np_hv(pred, GT=False, trhld=0.55, min_area=10):
     #axs[2].imshow(instance_map)
     #plt.show()
     return instance_map
-"""
+
 def count_blob(labels, blb, img, GT=False):
     # Se blb ha valori float o non è in formato uint8, lo normalizzo per la visualizzazione
     if blb.dtype != np.uint8:
@@ -153,12 +153,18 @@ def count_blob(labels, blb, img, GT=False):
     if 255 not in np.unique(blb_uint8):
         blb_uint8 = blb_uint8 * 255
 
-    img32 = img.astype(np.float32)  # OpenCV supporta float32
-
-    if img32.ndim == 2 or (img32.ndim == 3 and img32.shape[2] == 1):
-        contour_img = cv2.cvtColor(img32, cv2.COLOR_GRAY2BGR)
+    img_in = img
+    # Porta a uint8 preservando l'aspetto
+    if img_in.dtype == np.uint8:
+        contour_img = img_in.copy()
     else:
-        contour_img = cv2.cvtColor(img32, cv2.COLOR_RGB2BGR)
+        img_f = img_in.astype(np.float32, copy=False)
+        vmax = float(np.nanmax(img_f)) if img_f.size else 1.0
+        if vmax <= 1.0:
+            contour_img = np.clip(img_f * 255.0, 0, 255).astype(np.uint8)
+        else:
+            contour_img = np.clip(img_f, 0, 255).astype(np.uint8)
+    
     #fig, axs = plt.subplots(1,2,figsize=(8,8))
     #axs[0].imshow(contour_img)
     #axs[1].imshow(labels)
@@ -211,21 +217,18 @@ def count_blob(labels, blb, img, GT=False):
         if convex_hull_area == 0:
             continue  # Evita divisione per zero
 
-        cv2.drawContours(img, [cntr], 0, (0, 255, 0), 2)
+        cv2.drawContours(contour_img, [cntr], 0, (0, 255, 0), 2)
         isolated_count += 1
-    plt.imshow(img)
-    plt.axis("off")
-    plt.show()
-    return (contour_img, isolated_count, cluster_count)
-"""
-from skimage.measure import regionprops
+    return contour_img, isolated_count, cluster_count
 
+from skimage.measure import regionprops
+"""
 def count_blob(labels, blb, img, GT=False):
-    """
+    
     Disegna un solo contorno per ogni istanza (label > 0) su una copia di `img`.
     Ritorna (immagine_con_contorni, n_isolati).
     Conta solo gli isolated (tutti vengono considerati tali).
-    """
+    
     # --- prepara immagine di sfondo (BGR per cv2) ---
     img32 = img.astype(np.float32, copy=False)
     if img32.ndim == 2 or (img32.ndim == 3 and img32.shape[2] == 1):
@@ -253,10 +256,11 @@ def count_blob(labels, blb, img, GT=False):
         cntr = max(cnts, key=cv2.contourArea)
 
         isolated_count += 1
-        cv2.drawContours(out, [cntr], -1, (0, 255, 0), 2)  # verde
-    plt.imshow(out)
+        cv2.drawContours(img, [cntr], -1, (0, 255, 0), 2)  # verde
+    plt.imshow(img)
     plt.show()
     return out, isolated_count, _
+"""
 def nucle_counting(X_train, HV_train, Y_train, preds, i):
     seg_preds = preds['seg_head']
     hv_preds  = preds['hv_head']  # (batch, H, W, 2)

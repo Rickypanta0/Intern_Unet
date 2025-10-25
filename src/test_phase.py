@@ -116,7 +116,7 @@ from keras.metrics import F1Score, IoU
 def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     H = 256
     W = 256
-    I_f1_list = []
+    I_dq_list = []
     I_dice_list = []
     I_iou_list = []
     I_sq_list = []
@@ -139,7 +139,7 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     f1_neg    = 2*tn / (2*tn + fp + fn) if (2*tn + fp + fn) else 1.0
     f1_pixel  = float((f1_pos + f1_neg) / 2)
     best = [0,0]
-    mean = [None, 0.640, float('inf')]
+    mean = [None, 0.767, float('inf')]
     worst = [None, float("-inf")]
     #t_hv = t_aji = t_pq = t_dice = t_misc = 0.0
     for i in tqdm(range(Y.shape[0])):
@@ -165,7 +165,6 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
         #t_misc += time.perf_counter() - t0
         
         if y_true_bin.sum() == 0 and y_pred_bin.sum() == 0:
-            print("NNNNN")
             continue
         
         t0 = time.perf_counter()
@@ -184,25 +183,25 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
         
         #t0 = time.perf_counter()
         outcome,_ = get_fast_pq(label_true, label_pred)
-        f1, sq, pq = outcome
+        dq, sq, pq = outcome
         #t_pq += time.perf_counter() - t0
         #t0 = time.perf_counter()
         dice_val = get_fast_dice_2(label_true, label_pred)
         #print(f"ISTANCE: IoU[{i}]: {iou_val:.4f}, F1[{i}]: {outcome[0]:.4f}, Dice: {dice_val:.4f}")
         #t_dice += time.perf_counter() - t0
         #print(f"HV:{t_hv:.2f}s  AJI:{t_aji:.2f}s  PQ:{t_pq:.2f}s  Dice:{t_dice:.2f}s  Misc:{t_misc:.2f}s")
-        if best[1] < f1:
-            best[1] = f1
+        if best[1] < dq:
+            best[1] = dq
             best[0] = i
-        if abs(mean[1] - f1)<mean[2]:
+        if abs(mean[1] - dq)<mean[2]:
             mean[0]=i
-            mean[2]=np.abs(mean[1]-f1)
+            mean[2]=np.abs(mean[1]-dq)
         n_true = np.max(np.unique(label_true))
         n_pred = np.max(np.unique(label_pred))
         if worst[1]<abs(n_true-n_pred):
             worst[1]=abs(n_true-n_pred)
             worst[0]=i
-        I_f1_list.append(f1)
+        I_dq_list.append(dq)
         I_iou_list.append(iou_val)
         I_dice_list.append(dice_val)
         I_sq_list.append(sq)
@@ -210,13 +209,13 @@ def score_testSet(preds, Y, HV, X,trhld=0.43, min_area=10):
     print(f"BEST sample, index: {best[0]}")
     print(f"MEAN sample, index: {mean[0]}")
     print(f"WORST sample, index: {worst[0]}")
-    f1r = np.mean(I_f1_list)
+    dqr = np.mean(I_dq_list)
     dicer = np.mean(I_dice_list)
     iour = np.mean(I_iou_list)
     sqr = np.mean(I_sq_list)
     pqr = np.mean(I_pq_list)
 
-    return [f1r, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
+    return [dqr, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
 
 def print_labels_with_plot(scores_F1, scores_Dice, scores_IoU):
     # Crea DataFrame
@@ -486,8 +485,8 @@ def categorize_images(instance_masks):
 
     categories = []
     for i, (n, a, d) in enumerate(stats):
-        area_cat = "piccoli" if a < area_thresh else "grandi"
-        density_cat = "alta" if d < dist_thresh else "bassa"
+        area_cat = "small" if a < area_thresh else "large"
+        density_cat = "high" if d < dist_thresh else "low"
         categories.append((area_cat, density_cat))
     
     return categories  # lista di tuple (area_cat, density_cat)
@@ -503,10 +502,10 @@ def test_model_on_categories(preds, HV, Y, categories, trhld, min_area):
     hv_preds = preds['hv_head']
 
     results = {
-        ("piccoli", "alta"): [],
-        ("piccoli", "bassa"): [],
-        ("grandi", "alta"): [],
-        ("grandi", "bassa"): []
+        ("small", "high"): [],
+        ("small", "low"): [],
+        ("large", "high"): [],
+        ("large", "low"): []
     }
 
     for i in tqdm(range(Y.shape[0])):
@@ -588,7 +587,7 @@ def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
     del label_mask
     gc.collect()
     # Ordine categorie (gruppi sull'asse x) e modelli (box dentro ogni gruppo)
-    order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
+    order  = [("small","high"), ("small","low"), ("large","high"), ("large","low")]
     labels = ['RGB', 'Hematoxylin', 'Blu', 'Gray']
 
     # Contenitore: per ogni categoria, una lista di 4 liste (una per modello)
@@ -596,7 +595,7 @@ def label_img_calc_error(checkpoints, X, HV, Y, best_trshld, best_min_area):
 
     def _model_label_from_ckpt(path: str) -> str:
         if 'RGB' in path: return 'RGB'
-        if 'HE' in path or 'Hematoxylin' in path: return 'Hematoxylin'
+        if 'HE' in path: return 'Hematoxylin'
         if 'Blu' in path or 'Blue' in path: return 'Blu'
         if 'Gray' in path or 'Grey' in path: return 'Gray'
         return labels[0]  # fallback
@@ -671,6 +670,19 @@ def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
         # avanza base al prossimo gruppo
         base += n_models*dx + gap
 
+    def _debug_quartiles(errs_by_cat, model_labels, order):
+        print("\n=== Quartili per categoria/modello ===")
+        for cat in order:
+            print(f"\n{cat[0]}/{cat[1]}")
+            for m, lab in enumerate(model_labels):
+                vals = np.asarray(errs_by_cat[cat][m], float)
+                if np.all(~np.isfinite(vals)) or len(vals[~np.isnan(vals)]) == 0:
+                    print(f"  {lab}: <vuoto>")
+                    continue
+                q = np.percentile(vals[~np.isnan(vals)], [25, 50, 75])
+                print(f"  {lab}: Q1={q[0]:.3f}  Med={q[1]:.3f}  Q3={q[2]:.3f}  n={len(vals)}")
+    _debug_quartiles(errs_by_cat, model_labels, order)
+
     fig, ax = plt.subplots(figsize=(12, 5))
     bplots = ax.boxplot(
         data,
@@ -689,7 +701,7 @@ def _box_plot_grouped(errs_by_cat, model_labels, cat_order):
 
     # Asse x: nomi categorie
     ax.set_xticks(group_centers)
-    cat_order_eng  = [("small","high"), ("small","low"), ("big","high"), ("big","low")]
+    cat_order_eng  = [("small","high"), ("small","low"), ("large","high"), ("large","low")]
     ax.set_xticklabels([f"{a}/{d}" for (a, d) in cat_order_eng])
     ax.set_ylabel("Count error")
     #ax.set_title("Count error by categories")
@@ -817,20 +829,20 @@ checkpoint_HE = 'models/checkpoints/neo/model_HE_100.keras'
 checkpoint_RGB = 'models/checkpoints/neo/model_RGB_100.keras'
 checkpoint_Gray = 'models/checkpoints/neo/model_Gray_100.keras'
 
-checkpoint_paths=[checkpoint_RGB, checkpoint_HE]#, checkpoint_Blu, checkpoint_Gray]
-checkpoint_paths1=[checkpoint_Gray]#, checkpoint_Gray]
+checkpoint_paths1=[checkpoint_RGB, checkpoint_Gray]#, checkpoint_Blu, checkpoint_Gray]
+checkpoint_paths=[checkpoint_HE , checkpoint_Blu]
 #
 #model, X_ = loadmodel(checkpoint_path=checkpoint_RGB, weight_hv_head=1.0)
 #preds = model.predict(X_)
 
 
-preds, X = pre_proces(checkpoint_RGB, X)
+preds, X = pre_proces(checkpoint_Gray, X)
 seg_preds = preds['seg_head']
 hv_preds  = preds['hv_head']
 
-def test_qualitative(X,Y, seg_preds, hv_preds,i, trhld=0.43, min_area=10):
+def test_qualitative(X,Y, seg_preds, hv_preds,i, trhld=0.43, min_area=10, t=False):
 
-    mask_gt = X[i]
+    mask_gt = X[i]*255
     #costruzione maschera binaria
     seg = seg_preds[i]
     body_prob = seg[..., 0]
@@ -843,40 +855,46 @@ def test_qualitative(X,Y, seg_preds, hv_preds,i, trhld=0.43, min_area=10):
     # segmentazione con watershed guidata da HV map
     label_pred = __proc_np_hv(pred,trhld=trhld, min_area=min_area)
 
-    plt.imshow(mask_gt)
+    plt.imshow(mask_gt/255)
     plt.axis("off")
     plt.show()
-    plt.imshow(mask_pred, cmap="gray")
+    #plt.imshow(mask_pred, cmap="gray")
+    #plt.axis("off")
+    #plt.show()
+    #plt.imshow(hv[...,0])
+    #plt.axis("off")
+    #plt.show()
+    #plt.imshow(hv[...,1])
+    #plt.axis("off")
+    #plt.show()
+    img_contour, _, _ =  count_blob(label_pred, mask_pred, mask_gt)
+    plt.imshow(img_contour)
     plt.axis("off")
     plt.show()
-    plt.imshow(hv[...,0])
-    plt.axis("off")
-    plt.show()
-    plt.imshow(hv[...,1])
-    plt.axis("off")
-    plt.show()
-    count_blob(label_pred, mask_pred, mask_gt)
     #determinazione labels GT
     hv_t = HV[i]
     pred_ = np.stack([Y[i].squeeze(), hv_t[..., 0], hv_t[..., 1]], axis=-1)
     label_gt = __proc_np_hv(pred_,GT=True)
-    plt.imshow(label_gt)
-    plt.show()
-    plt.imshow(Y[i], cmap="gray")
-    plt.axis("off")
-    plt.show()
-    plt.imshow(hv_t[...,0])
-    plt.axis("off")
-    plt.show()
-    plt.imshow(hv_t[...,1])
-    plt.axis("off")
-    plt.show()
+    if t:
+        plt.imshow(label_gt)
+        plt.show()
+        plt.imshow(Y[i], cmap="gray")
+        plt.axis("off")
+        plt.show()
+        plt.imshow(hv_t[...,0])
+        plt.axis("off")
+        plt.show()
+        plt.imshow(hv_t[...,1])
+        plt.axis("off")
+        plt.show()
 
-    count_blob(label_gt, mask_gt, mask_gt)
-
+    img_contour, _, _ = count_blob(label_gt, Y[i], mask_gt)
+    plt.imshow(img_contour)
+    plt.axis("off")
+    plt.show()
     N_pred = np.max(np.unique(label_pred))
     N_gt =  np.max(np.unique(label_gt))
-
+    print(N_gt,N_pred)
     mae = abs(N_gt-N_pred)
 
     iou_val = get_fast_aji(label_gt, label_pred, pred_, pred, seg, X[i])
@@ -888,8 +906,8 @@ def test_qualitative(X,Y, seg_preds, hv_preds,i, trhld=0.43, min_area=10):
     print(f"MAE: {mae}, AIJ: {iou_val}, Dice: {dice_val}, DQ: {f1}, SQ: {sq}, PQ: {pq}")
     return N_gt, N_pred
 
-test_qualitative(X,Y,seg_preds, hv_preds, 1357, trhld=0.45)
-
+test_qualitative(X,Y,seg_preds, hv_preds, 887, trhld=0.43, t=False)
+#887
 """
 print("shape:", HV.shape, "dtype:", HV.dtype)     # atteso: (N,H,W,2), float32
 print("GT per-channel min/max:",
@@ -930,23 +948,23 @@ for i in range(idx,idx + 5):
 
     plt.tight_layout()
     plt.show()
-
+"""
 t_fg_grid    = np.round(np.arange(0.35, 0.61, 0.02), 2)
 t_seed_grid  = [0.55, 0.60, 0.65]
 min_area_grid= [10, 20, 30]
-"""
+
 #X_val, _, Y_val, _, HV_val, _ = train_test_split(X, Y, HV, test_size=0.1, random_state=SEED)
 
-#best = tune_params(X, Y, HV, seg_val_preds, hv_val_preds,t_fg_grid, min_area_grid)
+#best = tune_params(X, Y, HV, seg_preds, hv_preds,t_fg_grid, min_area_grid)
 #print(f"Migliori: t_fg={best[0]}, min_area={best[1]} | MAE={best[2]:.2f}, sMAPE={best[3]:.3f}")
-best_trshld =  0.45#best[0]
-best_min_area = 10#best[1]
+best_trshld =  best[0]
+best_min_area = best[1]
 
 #N_gt, N_pred_rgb = grafo_diffusione(X,Y,HV,preds, trhld=best_trshld, min_area=best_min_area)
 
-v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
+#v, v_ = score_testSet(preds, Y, HV, X, trhld=best_trshld, min_area=best_min_area)
 
-print(v,v_)
+#print(v,v_)
 #print(f"checkpoint: {checkpoint_HE}\n")
 
 #[dq, dicer, iour, sqr, pqr], [iou_pixel, f1_pixel]
@@ -964,11 +982,12 @@ print(v,v_)
 #label_img_calc_error(checkpoint_paths,X,HV,Y,best_trshld ,best_min_area)
 #for k, err in results.items():
 #    print(f"{k[0]} nuclei - {k[1]} densità → errore medio: {err:.2f}")
+"""
 JSONL_FILE = "runs/errors/errors.jsonl"
 
 # ordine coerente con il tuo codice
 labels = ['RGB', 'Hematoxylin', 'Blu', 'Gray']
-order  = [("piccoli","alta"), ("piccoli","bassa"), ("grandi","alta"), ("grandi","bassa")]
+order  = [("small","high"), ("small","low"), ("large","high"), ("large","low")]
 
 def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
                                 include_models=None, include_ckpts=None):
@@ -998,7 +1017,137 @@ def load_errs_by_cat_from_jsonl(jsonl_path, labels, order,
                     break
     return errs_by_cat
 
-errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
+#errs_by_cat = load_errs_by_cat_from_jsonl(JSONL_FILE, labels, order)
 
 # ora puoi usare direttamente la tua _box_plot_grouped(...)
-_box_plot_grouped(errs_by_cat, labels, order)
+#_box_plot_grouped(errs_by_cat, labels, order)
+import os
+import numpy as np
+import tifffile as tiff
+import imageio.v2 as imageio
+from tensorflow import keras
+import tensorflow as tf
+from patchify import patchify, unpatchify
+
+# ============ CONFIG ============
+MODEL_PATH = "models/checkpoints/neo/model_Gray_100.keras"
+ROOT_DIR   = Path("data/Ki67-MIB1/Ki67-MIB1")
+PRED_DIR   = ROOT_DIR / "preds"
+PATCH = 256
+STEP  = 256      # no overlap -> unpatchify semplice
+THR_HV = 0.45    # soglia per __proc_np_hv
+MIN_AREA = 10
+
+
+# ============ UTILS ============
+def normalize01(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    if x.max() > 1.0: x /= 255.0
+    return x
+
+def pad_reflect(img2d: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    h, w = img2d.shape
+    return np.pad(img2d, ((0, target_h - h), (0, target_w - w)), mode='reflect')
+
+def to_uint8_vis(img: np.ndarray) -> np.ndarray:
+    x = img.astype(np.float32)
+    vmax = float(np.nanmax(x)) if x.size else 1.0
+    x = np.clip(x * 255.0, 0, 255) if vmax <= 1.0 else np.clip(x, 0, 255)
+    return x.astype(np.uint8)
+
+def predict_one_image(model, img_path: Path, out_dir: Path):
+    # ----- LOAD IMAGE -----
+    img0 = tiff.imread(str(img_path))           # (H,W) o (H,W,C)
+    if img0.ndim == 3:
+        if img0.shape[-1] == 4: img0 = img0[..., :3]
+        img_gray = img0.mean(axis=-1)
+    else:
+        img_gray = img0
+    img_gray = normalize01(img_gray)
+
+    # ----- PAD a multipli di PATCH -----
+    H, W = img_gray.shape
+    Hpad = ((H + PATCH - 1) // PATCH) * PATCH
+    Wpad = ((W + PATCH - 1) // PATCH) * PATCH
+    img_pad = pad_reflect(img_gray, Hpad, Wpad)
+
+    # ----- PATCHIFY 2D -----
+    patches2d = patchify(img_pad, (PATCH, PATCH), step=STEP)  # (nr, nc, 256, 256)
+    n_rows, n_cols = patches2d.shape[:2]
+
+    # buffer per canale (unpatchify richiede 2D)
+    seg_body = np.zeros((n_rows, n_cols, PATCH, PATCH), dtype=np.float32)
+    seg_bg   = np.zeros((n_rows, n_cols, PATCH, PATCH), dtype=np.float32)
+    seg_bord = np.zeros((n_rows, n_cols, PATCH, PATCH), dtype=np.float32)
+    hv_x     = np.zeros((n_rows, n_cols, PATCH, PATCH), dtype=np.float32)
+    hv_y     = np.zeros((n_rows, n_cols, PATCH, PATCH), dtype=np.float32)
+
+    # ----- PRED LOOP -----
+    for i in range(n_rows):
+        for j in range(n_cols):
+            p2d = patches2d[i, j]                         # (256,256)
+            p3c = np.repeat(p2d[..., None], 3, axis=-1)   # (256,256,3)
+            preds = model.predict(p3c[None, ...], verbose=0)
+
+            if isinstance(preds, dict):
+                seg = preds["seg_head"][0]                # (256,256,3) body,bg,border
+                hv  = preds["hv_head"][0]                 # (256,256,2)
+            else:
+                out_names = [t.name.split('/')[0] for t in model.outputs]
+                seg_idx = out_names.index("seg_head"); hv_idx = out_names.index("hv_head")
+                seg = preds[seg_idx][0]; hv = preds[hv_idx][0]
+
+            if seg.min() < 0.0 or seg.max() > 1.0:        # logit -> prob
+                seg = tf.nn.softmax(seg, axis=-1).numpy()
+
+            seg_body[i, j] = seg[..., 0]
+            seg_bg  [i, j] = seg[..., 1]
+            seg_bord[i, j] = seg[..., 2]
+            hv_x    [i, j] = hv[..., 0]
+            hv_y    [i, j] = hv[..., 1]
+
+    # ----- UNPATCHIFY + CROP -----
+    body_full = unpatchify(seg_body, (Hpad, Wpad))[:H, :W]
+    bg_full   = unpatchify(seg_bg,   (Hpad, Wpad))[:H, :W]
+    bord_full = unpatchify(seg_bord, (Hpad, Wpad))[:H, :W]
+    hvx_full  = unpatchify(hv_x,     (Hpad, Wpad))[:H, :W]
+    hvy_full  = unpatchify(hv_y,     (Hpad, Wpad))[:H, :W]
+
+    seg_binary = ((body_full + bord_full) > bg_full).astype(np.uint8)
+
+    # ----- SAVE (mask + HV) -----
+    out_dir.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(str(out_dir / "pred_mask.png"), (seg_binary * 255).astype(np.uint8))
+    tiff.imwrite(str(out_dir / "pred_distance_x.tiff"), hvx_full.astype(np.float32))
+    tiff.imwrite(str(out_dir / "pred_distance_y.tiff"), hvy_full.astype(np.float32))
+
+    # ----- ISTANZE + CONTONI -----
+    pred_stack = np.stack([seg_binary.astype(np.float32), hvx_full, hvy_full], axis=-1)
+    label_pred = __proc_np_hv(pred_stack, trhld=THR_HV, min_area=MIN_AREA).astype(np.int32)
+
+    base_rgb = (np.stack([img0, img0, img0], axis=-1) if img0.ndim == 2 else img0)
+    base_rgb = to_uint8_vis(base_rgb)
+
+    contour_img, _, _ = count_blob(
+        labels=label_pred,
+        blb=(seg_binary * 255).astype(np.uint8),
+        img=base_rgb.copy(),
+        GT=False
+    )
+    imageio.imwrite(str(out_dir / "pred_contours.png"), contour_img)
+
+# ============ MAIN LOOP ============
+model = keras.models.load_model(MODEL_PATH, compile=False)
+
+tif_paths = sorted([p for p in ROOT_DIR.iterdir()
+                    if p.is_file() and p.suffix.lower() in (".tiff", ".tif")])
+
+for img_path in tif_paths:
+    name = img_path.stem
+    out_dir = PRED_DIR / name
+    print(f"[+] Processing {img_path.name} -> {out_dir}")
+    try:
+        predict_one_image(model, img_path, out_dir)
+    except Exception as e:
+        print(f"[!] Errore su {img_path.name}: {e}")
+        """

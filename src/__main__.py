@@ -63,15 +63,28 @@ class DataGenerator(keras.utils.Sequence):
         list_IDs_temp = [self.sample_map[k] for k in indexes]
         return self.__data_generation(list_IDs_temp)
 
-    def _mask_to_3ch(self, m2):
-        struct = np.ones((3, 3), dtype=bool)
+    def mask_to_3ch(self, m2, radius=1, iterations=1):
+        """
+        m2: binary mask (0/1 o 0/255) con 1 = foreground (nucleo)
+        radius: raggio del footprint (3x3 -> radius=1, 5x5 -> radius=2, ...)
+        iterations: passi di erosione (spessore del bordo)
+        """
+        m = (m2 > 0)  # bool foreground
 
-        m2_ = 1 - m2
-        body_ = binary_erosion(m2_, structure=struct).astype(np.uint8)
-        body = 1 - body_
+        footprint = np.ones((2*radius + 1, 2*radius + 1), dtype=bool)
 
-        border = (m2_ - body_).clip(0, 1).astype(np.uint8)
-        background = (1 - m2).astype(np.uint8)
+        # parte interna del nucleo (body) = erosione del foreground
+        body_bool = binary_erosion(m, structure=footprint, iterations=iterations, border_value=0)
+
+        # bordo = differenza tra fg e la sua erosione
+        border_bool = m & (~body_bool)
+
+        # background = complemento del fg
+        background_bool = ~m
+
+        body = body_bool.astype(np.uint8)
+        background = background_bool.astype(np.uint8)
+        border = border_bool.astype(np.uint8)
 
         return np.stack([body, background, border], axis=-1)
 
@@ -96,26 +109,26 @@ class DataGenerator(keras.utils.Sequence):
         HV = np.empty((N, H, W, 3), dtype=np.float32)
 
         for i, (fold_idx, local_idx) in enumerate(list_temp):
-            img_path, mask_path, instance_path = self.folds[fold_idx]
+            img_path, mask_path, hv_path = self.folds[fold_idx]
 
             img_rgb = np.load(img_path, mmap_mode='r')[local_idx].astype(np.float32)
-            img_rgb = (img_rgb + 15) / 255.0
+            img_rgb = (img_rgb) / 255.0
             
             #HESOINE EXTRACTION
             
-            #ihc_hed = rgb2hed(img_rgb)
-#
-            ## Create an RGB image for each of the stains
-            #null = np.zeros_like(ihc_hed[:, :, 0])
-            #img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
-            #img_rgb = self.hema_rgb(img_rgb)
+            ihc_hed = rgb2hed(img_rgb)
+
+            # Create an RGB image for each of the stains
+            null = np.zeros_like(ihc_hed[:, :, 0])
+            img_rgb = hed2rgb(np.stack((ihc_hed[:, :, 0], null, null), axis=-1))
+            img_rgb = self.hema_rgb(img_rgb)
 
             #BLU CHANNEL
             
-            blu = img_rgb[...,2]
-            blu_enhanced = np.clip(blu + 0.05, 0, 1)
-            cmap = get_cmap('Blues')
-            img_rgb = cmap(blu_enhanced)[:, :, :3] 
+            #blu = img_rgb[...,2]
+            #blu_enhanced = np.clip(blu + 0.05, 0, 1)
+            #cmap = get_cmap('Blues')
+            #img_rgb = cmap(blu_enhanced)[:, :, :3] 
 
             #GRAY SCALE
             #img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140])
@@ -126,34 +139,34 @@ class DataGenerator(keras.utils.Sequence):
             if mask.ndim == 3 and mask.shape[-1] == 1:
                 mask = np.squeeze(mask, axis=-1)
     
-            #hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
-            instance_M = np.load(instance_path, mmap_mode='r')[local_idx].astype(np.float32)
-            instance_map = build_instance_map_valuewise(instance_M)
-
+            hv = np.load(hv_path, mmap_mode='r')[local_idx].astype(np.float32)
+            #instance_M = np.load(instance_path, mmap_mode='r')[local_idx].astype(np.float32)
+            #instance_map = build_instance_map_valuewise(instance_M)
+            
             # Augmentation (NumPy-only)
             if self.augment:
                 if np.random.rand() < 0.5:
                     img_rgb = np.fliplr(img_rgb)
                     mask    = np.fliplr(mask)
-                    instance_map      = np.fliplr(instance_map)
-                    #hv[..., 0] *= -1  # inverti x
+                    hv      = np.fliplr(hv)
+                    hv[..., 0] *= -1  # inverti x
                 if np.random.rand() < 0.5:
                     img_rgb = np.flipud(img_rgb)
                     mask    = np.flipud(mask)
-                    instance_map      = np.flipud(instance_map)
-                    #hv[..., 1] *= -1  # inverti y
+                    hv      = np.flipud(hv)
+                    hv[..., 1] *= -1  # inverti y
                 k = np.random.randint(4)
                 img_rgb = np.rot90(img_rgb, k, axes=(0, 1))
                 mask    = np.rot90(mask,    k, axes=(0, 1))
-                instance_map      = np.rot90(instance_map,      k, axes=(0, 1))
-                #if   k == 1: hv = np.stack([-hv[...,1],  hv[...,0]], axis=-1)
-                #elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
-                #elif k == 3: hv = np.stack([ hv[...,1], -hv[...,0]], axis=-1)
+                hv      = np.rot90(hv, k, axes=(0, 1))
+                if   k == 1: hv = np.stack([ hv[...,1],  -hv[...,0]], axis=-1)
+                elif k == 2: hv = np.stack([-hv[...,0], -hv[...,1]], axis=-1)
+                elif k == 3: hv = np.stack([ -hv[...,1], hv[...,0]], axis=-1)
 
-            instance_input = instance_map[..., np.newaxis]
-            gen = GenInstanceHV(crop_shape=(H, W))
-            out = gen._augment(instance_input, None)
-            hv = out[..., 1:3]
+            #instance_input = instance_map[..., np.newaxis]
+            #gen = GenInstanceHV(crop_shape=(H, W))
+            #out = gen._augment(instance_input, None)
+            #hv = out[..., 1:3]
             #fig, axs = plt.subplots(1,2,figsize=(8,8))
             #axs[0].imshow(hv[...,0]); axs[0].axis('off')
             #axs[0].set_title("Horizontal map")
@@ -162,7 +175,7 @@ class DataGenerator(keras.utils.Sequence):
             #plt.show()
             import matplotlib.patches as patches
             X[i]  = img_rgb
-            Y[i]  = self._mask_to_3ch(mask)
+            Y[i]  = self.mask_to_3ch(mask)
             HV[i] = np.dstack([hv, mask])
 
         return X, {'seg_head': Y, 'hv_head': HV}
@@ -225,10 +238,10 @@ if __name__ == "__main__":
     folds = [
         (os.path.join(base, 'Fold 1', 'images', 'images.npy'),
          os.path.join(base, 'Fold 1', 'masks',  'binary_masks.npy'),
-         os.path.join(base, 'Fold 1', 'masks',  'masks.npy')),
+         os.path.join(base, 'Fold 1', 'masks',  'distance.npy')),
         (os.path.join(base, 'Fold 2', 'images', 'images.npy'),
          os.path.join(base, 'Fold 2', 'masks',  'binary_masks.npy'),
-         os.path.join(base, 'Fold 2', 'masks',  'masks.npy'))
+         os.path.join(base, 'Fold 2', 'masks',  'distance.npy'))
     ]
 
     num_all = sum(np.load(f[0], mmap_mode='r').shape[0] for f in folds)
@@ -257,7 +270,7 @@ if __name__ == "__main__":
         log_dir=os.path.join('logs', 'fit'),
         histogram_freq=1, write_images=False
     )
-    checkpoint_path = 'models/checkpoints/neo/model_Blu_100.keras'
+    checkpoint_path = 'models/checkpoints/neo/model_HE_100.keras'
     checkpoint_cb = keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         save_best_only=True, save_weights_only=False,
@@ -313,6 +326,7 @@ if __name__ == "__main__":
             axs[1,0].imshow(border_mask, cmap='gray')  # border
             axs[1,1].imshow(hv[...,0])  # body
             axs[1,2].imshow(hv[...,1])  # background
+            
 
             plt.tight_layout()
             plt.show()
